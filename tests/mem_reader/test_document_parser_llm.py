@@ -97,7 +97,7 @@ def test_markdown_h1_titles_are_passed_as_document_context():
     parser._split_text = MagicMock(return_value=["# 04 报名时间\n即日起至 5 月 29 日 24:00"])
     parser._get_doc_llm_response = MagicMock(
         return_value={
-            "memory list": [
+            "memory_list": [
                 {
                     "key": "报名截止时间",
                     "memory_type": "LongTermMemory",

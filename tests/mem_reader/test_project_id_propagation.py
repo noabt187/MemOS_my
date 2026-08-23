@@ -27,7 +27,7 @@ PROJECT_ID = "proj_42"
 MANAGER_USER_ID = "mgr_99"
 
 LLM_FINE_RESPONSE = (
-    '{"memory list": [{"key": "greeting", "memory_type": "LongTermMemory", '
+    '{"memory_list": [{"key": "greeting", "memory_type": "LongTermMemory", '
     '"value": "User greeted the assistant.", "tags": ["greeting"]}], '
     '"summary": "User said hello."}'
 )
@@ -362,6 +362,7 @@ class TestMultiModalProjectIdPropagation(unittest.TestCase):
 
         mock_transfer_items = [_make_fast_item("Extracted from image")]
         self.reader.multi_modal_parser = MagicMock()
+        self.reader.multi_modal_parser.can_parse_interleaved.return_value = False
         self.reader.multi_modal_parser.parse.return_value = [fast_item]
         self.reader.multi_modal_parser.process_transfer.return_value = mock_transfer_items
 

@@ -37,6 +37,10 @@ class BaseMemReaderConfig(BaseConfig):
         default=None,
         description="Vision LLM for image parsing. Falls back to general_llm if not set.",
     )
+    video_parser_llm: LLMConfigFactory | None = Field(
+        default=None,
+        description="Dedicated vision LLM for video parsing. Required for video inputs.",
+    )
     document_parser_llm: LLMConfigFactory | None = Field(
         default=None,
         description="Dedicated LLM for document content extraction",

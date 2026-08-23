@@ -49,8 +49,9 @@ def _flatten_info_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     """
     Flatten the 'info' field in metadata to the top level.
 
-    If metadata contains an 'info' field that is a dictionary, all its key-value pairs
-    will be moved to the top level of metadata, and the 'info' field will be removed.
+    Neo4j queries still need searchable top-level properties, while callers expect
+    the logical ``metadata.info`` object on reads. Keep a serialized copy and the
+    exact list of mirrored keys so the read boundary can reconstruct that shape.
 
     Args:
         metadata: Dictionary that may contain an 'info' field
@@ -63,12 +64,14 @@ def _flatten_info_fields(metadata: dict[str, Any]) -> dict[str, Any]:
         Output: {"user_id": "xxx", "A": "value1", "B": "value2"}
     """
     if "info" in metadata and isinstance(metadata["info"], dict):
-        # Copy info fields to top level
         info_dict = metadata.pop("info")
+        mirrored_keys = []
         for key, value in info_dict.items():
-            # Only add if key doesn't already exist at top level (to avoid overwriting)
             if key not in metadata:
                 metadata[key] = value
+                mirrored_keys.append(key)
+        metadata["_info_json"] = json.dumps(info_dict, ensure_ascii=False, sort_keys=True)
+        metadata["_info_keys"] = mirrored_keys
     return metadata
 
 
@@ -93,7 +96,71 @@ def _sanitize_neo4j_value(value: Any) -> Any:
 
 def _sanitize_neo4j_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
     """Ensure all metadata values are valid Neo4j property types."""
-    return {key: _sanitize_neo4j_value(value) for key, value in metadata.items()}
+    structured_list_fields = {"history", "historical_events"}
+    sanitized = {}
+    for key, value in metadata.items():
+        if key in structured_list_fields and isinstance(value, list):
+            sanitized[key] = json.dumps(value, ensure_ascii=False)
+        else:
+            sanitized[key] = _sanitize_neo4j_value(value)
+    return sanitized
+
+
+def _restore_neo4j_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Restore structured fields serialized at the Neo4j boundary."""
+    raw_info = metadata.pop("_info_json", None)
+    mirrored_keys = metadata.pop("_info_keys", [])
+    if isinstance(raw_info, str):
+        try:
+            restored_info = json.loads(raw_info)
+        except json.JSONDecodeError:
+            logger.warning("Failed to decode Neo4j info JSON; leaving flat fields unchanged")
+        else:
+            if isinstance(restored_info, dict):
+                metadata["info"] = restored_info
+                if isinstance(mirrored_keys, list):
+                    for key in mirrored_keys:
+                        if isinstance(key, str):
+                            metadata.pop(key, None)
+
+    internal_info = metadata.get("internal_info")
+    if isinstance(internal_info, str):
+        try:
+            restored = json.loads(internal_info)
+        except json.JSONDecodeError:
+            logger.warning("Failed to decode Neo4j internal_info JSON; leaving the value unchanged")
+        else:
+            if isinstance(restored, dict):
+                metadata["internal_info"] = restored
+            else:
+                logger.warning(
+                    "Decoded Neo4j internal_info is not an object; leaving the value unchanged"
+                )
+
+    for field in ("history", "historical_events"):
+        value = metadata.get(field)
+        if isinstance(value, str):
+            try:
+                restored = json.loads(value)
+            except json.JSONDecodeError:
+                logger.warning("Failed to decode Neo4j %s JSON; leaving it unchanged", field)
+                continue
+            if isinstance(restored, list):
+                metadata[field] = restored
+            continue
+
+        # Backward compatibility for records written as a list of JSON strings.
+        if isinstance(value, list) and value and all(isinstance(item, str) for item in value):
+            restored_items = []
+            for item in value:
+                try:
+                    restored_items.append(json.loads(item))
+                except json.JSONDecodeError:
+                    restored_items = []
+                    break
+            if restored_items:
+                metadata[field] = restored_items
+    return metadata
 
 
 class Neo4jGraphDB(BaseGraphDB):
@@ -1295,8 +1362,7 @@ class Neo4jGraphDB(BaseGraphDB):
 
         # Validate pagination parameters if pagination is enabled
         if use_pagination:
-            if page < 1:
-                page = 1
+            page = max(page, 1)
             if page_size < 1:
                 page_size = 10
             skip = (page - 1) * page_size
@@ -1873,7 +1939,7 @@ class Neo4jGraphDB(BaseGraphDB):
         return filter_conditions, filter_params
 
     def _parse_node(self, node_data: dict[str, Any]) -> dict[str, Any]:
-        node = node_data.copy()
+        node = _restore_neo4j_metadata(node_data.copy())
 
         # Convert Neo4j datetime to string
         for time_field in ("created_at", "updated_at"):

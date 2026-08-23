@@ -14,7 +14,7 @@ from memos.mem_reader.read_multi_modal.base import _derive_key
 from memos.mem_reader.read_pref_memory.process_preference_memory import process_preference_fine
 from memos.mem_reader.read_skill_memory.process_skill_memory import process_skill_memory_fine
 from memos.mem_reader.simple_struct import PROMPT_DICT, SimpleStructMemReader
-from memos.mem_reader.utils import parse_json_result
+from memos.mem_reader.utils import parse_json_result, validate_memory_extraction_result
 from memos.memories.textual.item import TextualMemoryItem, TreeNodeTextualMemoryMetadata
 from memos.plugins.hook_defs import H
 from memos.plugins.hooks import trigger_hook, trigger_single_hook
@@ -71,6 +71,12 @@ class MultiModalStructMemReader(SimpleStructMemReader):
             if config.image_parser_llm is not None
             else self.general_llm
         )
+        # Video parsing intentionally requires a dedicated configured vision model.
+        self.video_parser_llm = (
+            LLMFactory.from_config(config.video_parser_llm)
+            if config.video_parser_llm is not None
+            else None
+        )
         # Document parser LLM (separate from the fine-tuned chat extractor)
         self.document_parser_llm = (
             LLMFactory.from_config(config.document_parser_llm)
@@ -83,6 +89,7 @@ class MultiModalStructMemReader(SimpleStructMemReader):
             embedder=self.embedder,
             llm=self.llm,
             image_parser_llm=self.image_parser_llm,
+            video_parser_llm=self.video_parser_llm,
             document_parser_llm=self.document_parser_llm,
             parser=None,
             direct_markdown_hostnames=direct_markdown_hostnames,
@@ -501,11 +508,14 @@ class MultiModalStructMemReader(SimpleStructMemReader):
         messages = [{"role": "user", "content": prompt}]
         try:
             response_text = self.llm.generate(messages)
-            response_json = parse_json_result(response_text)
+            response_json = validate_memory_extraction_result(
+                parse_json_result(response_text),
+                context=f"{prompt_type} extraction",
+            )
         except Exception as e:
             logger.error(f"[LLM] Exception during chat generation: {e}")
             response_json = {
-                "memory list": [
+                "memory_list": [
                     {
                         "key": mem_str[:10],
                         "memory_type": "UserMemory",
@@ -699,8 +709,8 @@ class MultiModalStructMemReader(SimpleStructMemReader):
                 logger.error(f"[MultiModalFine] Error calling LLM: {e}")
                 return fine_items
 
-            if resp.get("memory list", []):
-                for m in resp.get("memory list", []):
+            if resp["memory_list"]:
+                for m in resp["memory_list"]:
                     try:
                         m_maybe_merged = m
                         if getattr(self, "memory_version_switch", "off") != "on":
@@ -971,8 +981,25 @@ class MultiModalStructMemReader(SimpleStructMemReader):
         # must pop here, avoid add to info, only used in sync fine mode
         custom_tags = info.pop("custom_tags", None) if isinstance(info, dict) else None
 
+        # Fine-mode ordered text + images must stay together. The legacy expansion
+        # below deliberately splits modalities and therefore cannot resolve
+        # cross-part references or continuous events.
+        if mode != "fast" and self.multi_modal_parser.can_parse_interleaved(scene_data_info):
+            logger.info("[MultiModalStruct] Using joint ordered image-text parser")
+            return self.multi_modal_parser.parse_interleaved(
+                scene_data_info,
+                info,
+                custom_tags=custom_tags,
+                user_context=kwargs.get("user_context"),
+            )
+
         # Stage: parse — parallel message parsing + sliding-window aggregation
         with timed_stage("add", "parse") as ts_parse:
+            parse_kwargs = dict(kwargs)
+            # Fine mode needs the inline bytes only until the specialised image
+            # parser has called the vision model. Explicit fast mode persists
+            # immediately, so its source must already be sanitised.
+            parse_kwargs["transient_media_source"] = mode != "fast"
             if isinstance(scene_data_info, list):
                 expanded_messages = self._expand_multimodal_messages(scene_data_info)
                 ts_parse.set(msg_count=len(expanded_messages))
@@ -986,7 +1013,7 @@ class MultiModalStructMemReader(SimpleStructMemReader):
                             info,
                             mode="fast",
                             need_emb=False,
-                            **kwargs,
+                            **parse_kwargs,
                         )
                         for msg in expanded_messages
                     ]
@@ -999,7 +1026,7 @@ class MultiModalStructMemReader(SimpleStructMemReader):
             else:
                 ts_parse.set(msg_count=1)
                 all_memory_items = self.multi_modal_parser.parse(
-                    scene_data_info, info, mode="fast", need_emb=False, **kwargs
+                    scene_data_info, info, mode="fast", need_emb=False, **parse_kwargs
                 )
 
             fast_memory_items = self._concat_multi_modal_memories(all_memory_items)
@@ -1221,7 +1248,7 @@ class MultiModalStructMemReader(SimpleStructMemReader):
                 part_type = part.get("type", "")
                 if part_type == "text":
                     text_parts.append(part.get("text", ""))
-                elif part_type in ("file", "image", "image_url"):
+                elif part_type in ("file", "image", "image_url", "video", "video_url"):
                     # Extract as a standalone message for its specialised parser
                     expanded.append(part)
                 else:
@@ -1240,19 +1267,22 @@ class MultiModalStructMemReader(SimpleStructMemReader):
     @staticmethod
     def _is_file_url_only_item(item: TextualMemoryItem) -> bool:
         """
-        Check if a fast memory item contains only file-URL sources.
+        Check if a fast memory item contains only specialised media sources.
+
+        File, image, and video placeholders must be handled by their dedicated
+        parsers. Sending their placeholder text through the generic text reader
+        creates duplicate or meaningless memories such as "a video was imported".
         Args:
             item: TextualMemoryItem to check
 
         Returns:
-            True if all sources are file-type with URL info (metadata only)
+            True if all sources belong to a specialised media parser.
         """
         sources = item.metadata.sources or []
         if not sources:
             return False
-        return all(
-            getattr(s, "type", None) == "file" and getattr(s, "file_info", None) for s in sources
-        )
+        media_types = {"file", "image", "image_url", "video", "video_url"}
+        return all(getattr(source, "type", None) in media_types for source in sources)
 
     def get_scene_data_info(self, scene_data: list, type: str) -> list[list[Any]]:
         """

@@ -30,6 +30,7 @@ from memos.mem_reader.utils import (
     parse_json_result,
     parse_keep_filter_response,
     parse_rewritten_response,
+    validate_memory_extraction_result,
 )
 from memos.memories.textual.item import (
     SourceMessage,
@@ -292,14 +293,8 @@ class SimpleStructMemReader(BaseMemReader, ABC):
         response_json = self._safe_parse(response_text)
 
         if not response_json:
-            # NOTE: the key MUST be ``"memory list"`` (with a space) — the
-            # downstream consumers in ``_process_chat_data`` /
-            # ``_process_transfer_chat_data`` read via
-            # ``resp.get("memory list", [])``. A typo here drops the
-            # salvaged item silently and causes ``/product/add`` to return
-            # 200 with zero memories written to Neo4j (bug #1355).
-            return {
-                "memory list": [
+            response_json = {
+                "memory_list": [
                     {
                         "key": mem_str[:10],
                         "memory_type": "UserMemory",
@@ -309,8 +304,24 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 ],
                 "summary": mem_str,
             }
-
-        return response_json
+        try:
+            return validate_memory_extraction_result(response_json, context="chat extraction")
+        except Exception as exc:
+            logger.error("[LLM] Invalid chat extraction schema: %s", exc)
+            return validate_memory_extraction_result(
+                {
+                    "memory_list": [
+                        {
+                            "key": mem_str[:10],
+                            "memory_type": "UserMemory",
+                            "value": mem_str,
+                            "tags": [],
+                        }
+                    ],
+                    "summary": mem_str,
+                },
+                context="chat extraction fallback",
+            )
 
     def _iter_chat_windows(self, scene_data_info, max_tokens=None, overlap=200):
         """
@@ -406,7 +417,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
             chat_read_nodes = []
             for w in windows:
                 resp = self._get_llm_response(w["text"], custom_tags)
-                for m in resp.get("memory list", []):
+                for m in resp["memory_list"]:
                     try:
                         memory_type = (
                             m.get("memory_type", "LongTermMemory")
@@ -443,7 +454,7 @@ class SimpleStructMemReader(BaseMemReader, ABC):
                 ctx_kwargs["project_id"] = user_context.project_id
 
         chat_read_nodes = []
-        for memory_i_raw in response_json.get("memory list", []):
+        for memory_i_raw in response_json["memory_list"]:
             try:
                 memory_type = (
                     memory_i_raw.get("memory_type", "LongTermMemory")

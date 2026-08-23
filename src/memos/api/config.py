@@ -14,6 +14,7 @@ import requests
 from dotenv import load_dotenv
 
 from memos.context.context import ContextThread
+from memos.exceptions import ConfigurationError
 
 
 if TYPE_CHECKING:
@@ -477,6 +478,40 @@ class APIConfig:
             return APIConfig._build_provider_llm_config(image_model, max_tokens=4096)
         # Fallback to general_llm config (which itself falls back to OpenAI)
         return APIConfig.get_memreader_general_llm_config()
+
+    @staticmethod
+    def get_video_parser_llm_config() -> dict[str, Any] | None:
+        """Get the dedicated video-capable vision LLM configuration.
+
+        Video parsing has no fallback because a text or image-only model may
+        silently accept the request while failing to understand the video.
+        Its endpoint and credentials are isolated from QWEN_* and OPENAI_* so
+        other providers (for example an image-only Mimo endpoint) cannot be
+        selected accidentally.
+        """
+        video_model = os.getenv("VIDEO_PARSER_MODEL")
+        if not video_model:
+            return None
+
+        video_api_key = os.getenv("VIDEO_API_KEY")
+        video_api_base = os.getenv("VIDEO_API_BASE")
+        missing = [
+            name
+            for name, value in (
+                ("VIDEO_API_KEY", video_api_key),
+                ("VIDEO_API_BASE", video_api_base),
+            )
+            if not value or not value.strip()
+        ]
+        if missing:
+            raise ConfigurationError(
+                "VIDEO_PARSER_MODEL requires dedicated video credentials: " + ", ".join(missing)
+            )
+
+        config = APIConfig._build_provider_llm_config(video_model, max_tokens=4096)
+        config["config"]["api_key"] = video_api_key
+        config["config"]["api_base"] = video_api_base.rstrip("/")
+        return config
 
     @staticmethod
     def get_document_parser_llm_config() -> dict[str, Any] | None:
@@ -1012,6 +1047,8 @@ class APIConfig:
                     "general_llm": APIConfig.get_memreader_general_llm_config(),
                     # Image parser LLM (requires vision model)
                     "image_parser_llm": APIConfig.get_image_parser_llm_config(),
+                    # Video parser LLM (required only when video input is used)
+                    "video_parser_llm": APIConfig.get_video_parser_llm_config(),
                     # Dedicated LLM for document chunk extraction
                     "document_parser_llm": APIConfig.get_document_parser_llm_config(),
                     # Preference extractor LLM. Reader falls back to general_llm when unset.
@@ -1147,6 +1184,8 @@ class APIConfig:
                     "general_llm": APIConfig.get_memreader_general_llm_config(),
                     # Image parser LLM (requires vision model)
                     "image_parser_llm": APIConfig.get_image_parser_llm_config(),
+                    # Video parser LLM (required only when video input is used)
+                    "video_parser_llm": APIConfig.get_video_parser_llm_config(),
                     # Dedicated LLM for document chunk extraction
                     "document_parser_llm": APIConfig.get_document_parser_llm_config(),
                     # Preference extractor LLM. Reader falls back to general_llm when unset.

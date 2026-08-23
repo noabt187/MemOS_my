@@ -19,6 +19,8 @@ from memos.memories.textual.item import TextualMemoryItem
 
 from .openai_chat_completion_types import (
     ChatCompletionContentPartTextParam,
+    ChatCompletionContentPartVideoParam,
+    ChatCompletionContentPartVideoURLParam,
     ChatCompletionMessageParam,
     File,
 )
@@ -58,7 +60,12 @@ class MessageDict(TypedDict, total=False):
     message_id: str | None  # Optional unique identifier for the message
 
 
-RawMessageDict: TypeAlias = ChatCompletionContentPartTextParam | File
+RawMessageDict: TypeAlias = (
+    ChatCompletionContentPartTextParam
+    | ChatCompletionContentPartVideoParam
+    | ChatCompletionContentPartVideoURLParam
+    | File
+)
 
 
 # Message collections

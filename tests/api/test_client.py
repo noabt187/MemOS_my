@@ -296,7 +296,7 @@ def test_chat_sends_updated_existing_request_fields(
     assert payload["include_tool_memory"] is True
     assert payload["tool_memory_limit_number"] == 3
     assert payload["relativity"] == 0.1
-    assert payload["add_message_on_answer"] is True
+    assert payload["add_message_on_answer"] is False
 
 
 def test_add_knowledgebase_file_form_sends_type_and_closes_files(

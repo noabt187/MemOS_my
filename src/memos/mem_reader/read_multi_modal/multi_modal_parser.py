@@ -9,6 +9,7 @@ import traceback
 from typing import Any
 
 from memos.embedders.base import BaseEmbedder
+from memos.exceptions import ConfigurationError, ParserError
 from memos.llms.base import BaseLLM
 from memos.log import get_logger
 from memos.memories.textual.item import SourceMessage, TextualMemoryItem
@@ -19,12 +20,14 @@ from .assistant_parser import AssistantParser
 from .base import BaseMessageParser
 from .file_content_parser import FileContentParser
 from .image_parser import ImageParser
+from .interleaved_media_parser import InterleavedMediaParser
 from .string_parser import StringParser
 from .system_parser import SystemParser
 from .text_content_parser import TextContentParser
 from .tool_parser import ToolParser
 from .user_parser import UserParser
 from .utils import extract_role
+from .video_parser import VideoParser
 
 
 logger = get_logger(__name__)
@@ -38,6 +41,7 @@ class MultiModalParser:
         embedder: BaseEmbedder,
         llm: BaseLLM | None = None,
         image_parser_llm: BaseLLM | None = None,
+        video_parser_llm: BaseLLM | None = None,
         document_parser_llm: BaseLLM | None = None,
         parser: Any | None = None,
         direct_markdown_hostnames: list[str] | None = None,
@@ -50,6 +54,8 @@ class MultiModalParser:
             llm: Optional main LLM for standard text/chat extraction.
             image_parser_llm: Optional vision LLM for image parsing.
                 Falls back to llm if not provided.
+            video_parser_llm: Dedicated vision LLM for video parsing.
+                Does not fall back to another LLM.
             document_parser_llm: Optional dedicated LLM for document extraction.
             parser: Optional parser for parsing file contents
             direct_markdown_hostnames: List of hostnames that should return markdown directly
@@ -60,6 +66,7 @@ class MultiModalParser:
         self.llm = llm
         # Image parser LLM (requires vision model), falls back to main llm
         self.image_parser_llm = image_parser_llm if image_parser_llm is not None else llm
+        self.video_parser_llm = video_parser_llm
         self.document_parser_llm = document_parser_llm
         self.parser = parser
 
@@ -72,6 +79,8 @@ class MultiModalParser:
         self.text_content_parser = TextContentParser(embedder, llm)
         # Use dedicated image_parser_llm for image parsing (requires vision model)
         self.image_parser = ImageParser(embedder, self.image_parser_llm)
+        self.interleaved_media_parser = InterleavedMediaParser(embedder, self.image_parser_llm)
+        self.video_parser = VideoParser(embedder, self.video_parser_llm)
         self.file_content_parser = FileContentParser(
             embedder,
             self.document_parser_llm,
@@ -93,6 +102,8 @@ class MultiModalParser:
             "file": self.file_content_parser,
             "image": self.image_parser,
             "image_url": self.image_parser,  # Support both "image" and "image_url"
+            "video": self.video_parser,
+            "video_url": self.video_parser,
             "audio": self.audio_parser,
             # Custom tool formats
             "tool_description": self.tool_parser,
@@ -166,13 +177,44 @@ class MultiModalParser:
             logger.warning(f"[MultiModalParser] No parser found for message: {message}")
             return []
 
-        logger.info(f"[{parser.__class__.__name__}] Parsing message in {mode} mode: {message}")
+        if isinstance(parser, (ImageParser, VideoParser)):
+            logger.info(
+                "[%s] Parsing %s message in %s mode",
+                parser.__class__.__name__,
+                "video" if isinstance(parser, VideoParser) else "image",
+                mode,
+            )
+        else:
+            logger.info(
+                "[%s] Parsing message in %s mode: %s", parser.__class__.__name__, mode, message
+            )
         # Parse using the appropriate parser
         try:
             return parser.parse(message, info, mode=mode, **kwargs)
+        except (ConfigurationError, ParserError):
+            raise
         except Exception as e:
             logger.error(f"[MultiModalParser] Error parsing message: {e}")
             return []
+
+    def can_parse_interleaved(self, messages: Any) -> bool:
+        """Return whether messages should be processed as one ordered image sequence."""
+        return self.interleaved_media_parser.can_parse(messages)
+
+    def parse_interleaved(
+        self,
+        messages: list[Any],
+        info: dict[str, Any],
+        custom_tags: list[str] | None = None,
+        **kwargs: Any,
+    ) -> list[TextualMemoryItem]:
+        """Jointly parse ordered text and images into native memory items."""
+        return self.interleaved_media_parser.parse_fine(
+            messages,
+            info,
+            custom_tags=custom_tags,
+            **kwargs,
+        )
 
     @timed
     def parse_batch(
@@ -245,6 +287,8 @@ class MultiModalParser:
             parser = self.text_content_parser
         elif source.type in ["image", "image_url"]:
             parser = self.image_parser
+        elif source.type in ["video", "video_url"]:
+            parser = self.video_parser
         elif source.role:
             # Chat message, use role parser
             parser = self.role_parsers.get(source.role)
@@ -270,6 +314,8 @@ class MultiModalParser:
             return parser.parse_fine(
                 message, info, context_items=context_items, custom_tags=custom_tags, **kwargs
             )
+        except (ConfigurationError, ParserError):
+            raise
         except Exception as e:
             logger.error(f"[MultiModalParser] Error parsing in fine mode: {e}")
             return []

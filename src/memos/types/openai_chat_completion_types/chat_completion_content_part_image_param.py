@@ -22,6 +22,27 @@ class ImageURL(TypedDict, total=False):
     image_id: str
     """Optional custom image id for tracking image sources."""
 
+    instruction: str
+    """Optional user guidance for understanding this image."""
+
+    source_path: str
+    """Original local path used as a durable source reference."""
+
+    filename: str
+    """Original image filename."""
+
+    mime_type: str
+    """Detected image MIME type."""
+
+    file_size: int
+    """Original image size in bytes."""
+
+    sha256: str
+    """SHA-256 digest used to identify the original image."""
+
+    source_recorded_at: str
+    """Time at which the image or screenshot was recorded."""
+
 
 class ChatCompletionContentPartImageParam(TypedDict, total=False):
     image_url: Required[ImageURL]

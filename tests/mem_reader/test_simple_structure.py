@@ -53,7 +53,7 @@ class TestSimpleStructMemReader(unittest.TestCase):
         # Mock LLM response
 
         mock_response = (
-            '{"memory list": [{"key": "Planned scope adjustment", "memory_type": "UserMemory", '
+            '{"memory_list": [{"key": "Planned scope adjustment", "memory_type": "UserMemory", '
             '"value": "Tom planned to suggest in a meeting on June 27, 2025 at 9:30 AM", '
             '"tags": ["planning", "deadline change", "feature prioritization"]}], '
             '"summary": "Tom is currently focused on managing a new project with a tight schedule."}'
@@ -122,13 +122,8 @@ class TestSimpleStructMemReader(unittest.TestCase):
         """Regression test for issue #1355.
 
         When the LLM response cannot be parsed as JSON, `_get_llm_response`
-        is expected to return a fallback dict whose ``"memory list"`` (with
-        a single space) entry contains one salvaged ``UserMemory`` item built
-        from the raw user input. Downstream consumers in
-        ``_process_chat_data`` read ``resp.get("memory list", [])`` — if the
-        fallback uses the wrong key (e.g. ``"memory_list"`` with an
-        underscore) the salvaged memory is silently dropped and the request
-        produces zero memories despite returning HTTP 200.
+        must return the canonical ``memory_list`` envelope with one salvaged
+        ``UserMemory`` item built from the raw user input.
         """
         # Force `_safe_parse` to return None so the fallback branch is taken.
         self.reader.llm.generate.return_value = "not-valid-json"
@@ -136,9 +131,7 @@ class TestSimpleStructMemReader(unittest.TestCase):
 
         resp = self.reader._get_llm_response("test memory content", custom_tags=None)
 
-        # The fallback must use the "memory list" (with space) key the
-        # rest of the pipeline reads; verify the salvaged item shape too.
-        salvaged = resp.get("memory list", [])
+        salvaged = resp["memory_list"]
         self.assertEqual(
             len(salvaged),
             1,

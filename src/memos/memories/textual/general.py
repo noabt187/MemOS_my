@@ -8,8 +8,10 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt
 
 from memos.configs.memory import GeneralTextMemoryConfig
 from memos.embedders.factory import ArkEmbedder, EmbedderFactory, OllamaEmbedder
+from memos.exceptions import ParserError
 from memos.llms.factory import AzureLLM, LLMFactory, OllamaLLM, OpenAILLM
 from memos.log import get_logger
+from memos.mem_reader.utils import validate_memory_extraction_result
 from memos.memories.textual.base import BaseTextMemory
 from memos.memories.textual.item import TextualMemoryItem
 from memos.templates.mem_reader_prompts import SIMPLE_STRUCT_MEM_READER_PROMPT
@@ -37,7 +39,7 @@ class GeneralTextMemory(BaseTextMemory):
 
     @retry(
         stop=stop_after_attempt(3),
-        retry=retry_if_exception_type(json.JSONDecodeError),
+        retry=retry_if_exception_type((json.JSONDecodeError, ParserError)),
         before_sleep=lambda retry_state: logger.warning(
             f"Extracting memory failed due to JSON decode error: {retry_state.outcome.exception()}, Attempt retry: {retry_state.attempt_number} / {3}"
         ),
@@ -61,7 +63,10 @@ class GeneralTextMemory(BaseTextMemory):
         )
         messages = [{"role": "user", "content": prompt}]
         response_text = self.extractor_llm.generate(messages)
-        response_json = self.parse_json_result(response_text)
+        response_json = validate_memory_extraction_result(
+            self.parse_json_result(response_text),
+            context="general text memory extraction",
+        )
 
         extracted_memories = [
             TextualMemoryItem(
@@ -73,7 +78,7 @@ class GeneralTextMemory(BaseTextMemory):
                     "updated_at": datetime.now().isoformat(),
                 },
             )
-            for memory_dict in response_json["memory list"]
+            for memory_dict in response_json["memory_list"]
         ]
 
         return extracted_memories

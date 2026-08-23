@@ -1,10 +1,65 @@
 import json
 import re
 
+from typing import Any
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
+
 from memos import log
+from memos.exceptions import ParserError
 
 
 logger = log.get_logger(__name__)
+
+
+class MemoryExtractionItem(BaseModel):
+    """Canonical item returned by every memory-extraction prompt."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str = ""
+    memory_type: str = "LongTermMemory"
+    value: str
+    tags: list[Any] = Field(default_factory=list)
+    evidence_part_ids: list[str] = Field(default_factory=list)
+    confidence: float | None = None
+
+
+class MemorySequenceGroup(BaseModel):
+    """Optional grouping evidence returned by interleaved-media extraction."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    part_ids: list[str] = Field(default_factory=list)
+    relationship: str = ""
+    summary: str = ""
+
+
+class MemoryExtractionResult(BaseModel):
+    """Canonical snake_case envelope for memory-extraction model output."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    memory_list: list[MemoryExtractionItem]
+    summary: Any = ""
+    sequence_groups: list[MemorySequenceGroup] = Field(default_factory=list)
+    uncertainties: list[Any] = Field(default_factory=list)
+
+
+def validate_memory_extraction_result(
+    payload: Any,
+    *,
+    context: str = "memory extraction",
+) -> dict[str, Any]:
+    """Validate model output without silently treating schema errors as no memories."""
+    try:
+        result = MemoryExtractionResult.model_validate(payload)
+    except ValidationError as exc:
+        raise ParserError(
+            f"{context} response must use the canonical memory_list schema: {exc}"
+        ) from exc
+    return result.model_dump()
+
 
 try:
     import tiktoken
@@ -38,7 +93,7 @@ def derive_key(text: str, max_len: int = 80) -> str:
 def parse_json_result(response_text: str) -> dict:
     s = (response_text or "").strip()
 
-    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.I)
+    m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.IGNORECASE)
     s = (m.group(1) if m else s.replace("```", "")).strip()
 
     i = s.find("{")
@@ -83,7 +138,7 @@ def parse_rewritten_response(text: str) -> tuple[bool, dict[int, dict]]:
     Returns (success, parsed_dict) with int keys.
     """
     try:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
         s = (m.group(1) if m else text).strip()
         data = json.loads(s)
     except Exception:
@@ -127,7 +182,7 @@ def parse_keep_filter_response(text: str) -> tuple[bool, dict[int, dict]]:
     Returns (success, parsed_dict) with int keys.
     """
     try:
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.I)
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
         s = (m.group(1) if m else text).strip()
         data = json.loads(s)
     except Exception:

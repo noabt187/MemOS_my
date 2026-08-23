@@ -4,10 +4,8 @@
 memory items. Root cause: when the LLM response fails JSON parsing,
 `SimpleStructMemReader._get_llm_response` is supposed to emit a fallback dict
 with a single salvaged `UserMemory` item so the request still produces at least
-one stored memory. However, the fallback used the key `"memory_list"`
-(underscore) while every downstream consumer reads `"memory list"` (space),
-making the fallback unreachable and leaving `_process_chat_data` returning an
-empty list.
+one stored memory. The extraction contract now uses the canonical snake_case
+key `"memory_list"` in prompts, fallbacks, validation, and all consumers.
 
 These tests pin the fallback contract and the end-to-end reader behavior so the
 regression cannot reappear.
@@ -52,10 +50,8 @@ class TestSimpleStructFallbackKey(unittest.TestCase):
     def test_get_llm_response_fallback_key_matches_consumer(self):
         """Fallback dict must expose its item under the consumer-side key.
 
-        Downstream consumers in `_process_chat_data` (line 397) and
-        `_process_transfer_chat_data` (line 434) both read `"memory list"`
-        (with space). The fallback dict therefore MUST use the same key, or it
-        is effectively dead code and the request stores nothing.
+        Downstream consumers and fallbacks must use the same canonical
+        snake_case field name or the request could store nothing.
         """
         # Force `_safe_parse` to behave as if the LLM returned unparseable
         # output (the realistic failure mode reported in #1493 / #1355).
@@ -64,13 +60,12 @@ class TestSimpleStructFallbackKey(unittest.TestCase):
         result = self.reader._get_llm_response("I like strawberry.", custom_tags=None)
 
         self.assertIn(
-            "memory list",
+            "memory_list",
             result,
-            "Fallback dict must use the consumer-side key 'memory list' (with space). "
-            "Using 'memory_list' (underscore) leaves the fallback unreachable.",
+            "Fallback dict must use the canonical 'memory_list' key.",
         )
-        self.assertEqual(len(result["memory list"]), 1)
-        item = result["memory list"][0]
+        self.assertEqual(len(result["memory_list"]), 1)
+        item = result["memory_list"][0]
         self.assertEqual(item["memory_type"], "UserMemory")
         self.assertEqual(item["value"], "I like strawberry.")
 

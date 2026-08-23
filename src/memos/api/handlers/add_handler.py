@@ -52,8 +52,16 @@ class AddHandler(BaseHandler):
         Returns:
             MemoryResponse with added memory information
         """
+        messages = add_req.messages
+        message_count = len(messages) if isinstance(messages, list) else int(messages is not None)
         self.logger.info(
-            f"[DIAGNOSTIC] server_router -> add_handler.handle_add_memories called (Modified at 2025-11-29 18:46). Full request: {add_req.model_dump_json(indent=2)}"
+            "[AddHandler] add request user_id=%s cube_count=%s message_count=%s "
+            "async_mode=%s mode=%s",
+            add_req.user_id,
+            len(add_req.writable_cube_ids or []),
+            message_count,
+            add_req.async_mode,
+            add_req.mode,
         )
 
         if add_req.info:

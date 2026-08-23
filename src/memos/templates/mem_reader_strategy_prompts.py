@@ -46,7 +46,7 @@ Please perform the following
 
 Return a valid JSON object with the following structure:
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <string, a unique and concise memory title>,
       "memory_type": <string, "LongTermMemory" or "UserMemory">,
@@ -73,7 +73,7 @@ user: [June 26, 2025 at 4:21 PM]: Good idea. I’ll raise it in tomorrow’s 9:3
 
 Output:
 {
-  "memory list": [
+  "memory_list": [
     {
         "key": "Initial project meeting",
         "memory_type": "LongTermMemory",
@@ -143,7 +143,7 @@ STRATEGY_STRUCT_MEM_READER_PROMPT_ZH = """您是记忆提取专家。
 
 返回一个有效的JSON对象，结构如下：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <字符串，唯一且简洁的记忆标题>,
       "memory_type": <字符串，"LongTermMemory" 或 "UserMemory">,
@@ -170,7 +170,7 @@ user: [2025年6月26日下午4:21]：好主意。我明天上午9:30的会上提
 
 输出：
 {
-  "memory list": [
+  "memory_list": [
     {
         "key": "项目初期会议",
         "memory_type": "LongTermMemory",
@@ -202,7 +202,7 @@ user｜19:52：行，周六（7/19）去国贸试，合适就买。
 assistant｜19:54：记得看肩带可调/有无内衬，醋酸/真丝优先干洗；准备同色安全裤/防走光贴。如果当天没货，可下单调货或线上下单门店自提。
 
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "参加婚礼购买裙子",
       "memory_type": "UserMemory",

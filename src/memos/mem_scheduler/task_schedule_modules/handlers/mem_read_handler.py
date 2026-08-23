@@ -20,6 +20,7 @@ from memos.mem_scheduler.schemas.task_schemas import (
 from memos.mem_scheduler.task_schedule_modules.base_handler import BaseSchedulerHandler
 from memos.mem_scheduler.utils.filter_utils import transform_name_to_key
 from memos.mem_scheduler.utils.misc_utils import is_playground_api
+from memos.memories.textual.relationship import PersonalMemoryNormalizer, RelationshipUpdater
 from memos.memories.textual.tree import TreeTextMemory
 
 
@@ -195,12 +196,46 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                         for memory in flattened_memories
                         if memory.metadata.memory_type != "RawFileMemory"
                     ]
+                    normalization = PersonalMemoryNormalizer(
+                        getattr(mem_reader, "general_llm", None),
+                        text_mem.embedder,
+                    ).normalize(mem_group, user_id=user_id, use_llm=True)
+                    mem_group = normalization.events
                     enhanced_mem_ids = text_mem.add(mem_group, user_name=user_name)
                     logger.info(
                         "Added %s enhanced memories: %s",
                         len(enhanced_mem_ids),
                         enhanced_mem_ids,
                     )
+                    try:
+                        relationship_updater = RelationshipUpdater(
+                            text_mem=text_mem,
+                            llm=getattr(mem_reader, "general_llm", None),
+                        )
+                        relationship_ids = relationship_updater.process(
+                            memories=mem_group,
+                            memory_ids=enhanced_mem_ids,
+                            user_id=user_id,
+                            user_name=user_name,
+                        )
+                        direct_relationship_ids = relationship_updater.process_contact_updates(
+                            normalization.contact_updates,
+                            user_id=user_id,
+                            user_name=user_name,
+                        )
+                        relationship_ids = list(
+                            dict.fromkeys([*relationship_ids, *direct_relationship_ids])
+                        )
+                        if relationship_ids:
+                            logger.info(
+                                "Updated %s relationship summaries from async memories",
+                                len(relationship_ids),
+                            )
+                    except Exception:
+                        logger.exception(
+                            "Failed to update relationship summaries from async memories; "
+                            "enhanced event memories remain stored"
+                        )
 
                     # add raw file nodes and edges
                     if mem_reader.save_rawfile:

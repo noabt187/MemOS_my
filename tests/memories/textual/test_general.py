@@ -105,7 +105,7 @@ class TestGeneralTextMemory(unittest.TestCase):
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "Hi there"},
         ]
-        mock_response = '{"memory list": [{"key": "greeting", "value": "Hello", "tags": ["test"]}]}'
+        mock_response = '{"memory_list": [{"key": "greeting", "value": "Hello", "tags": ["test"]}]}'
         self.memory.extractor_llm.generate.return_value = mock_response
 
         # Execute

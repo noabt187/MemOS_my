@@ -20,6 +20,7 @@ from memos.mem_reader.read_multi_modal.utils import (
     get_parser,
     parse_json_result,
 )
+from memos.mem_reader.utils import validate_memory_extraction_result
 from memos.memories.textual.item import (
     SourceMessage,
     TextualMemoryItem,
@@ -91,7 +92,10 @@ class FileContentParser(BaseMessageParser):
         messages = [{"role": "user", "content": prompt}]
         try:
             response_text = self.llm.generate(messages)
-            response_json = parse_json_result(response_text)
+            response_json = validate_memory_extraction_result(
+                parse_json_result(response_text),
+                context="document extraction",
+            )
         except Exception as e:
             logger.error(f"[FileContentParser] LLM generation error: {e}")
             response_json = {}
@@ -690,7 +694,7 @@ class FileContentParser(BaseMessageParser):
             # Priority 1: If file_data is provided, process it
             if file_data:
                 if isinstance(file_data, str):
-                    url_str = file_data[1:] if file_data.startswith("@") else file_data
+                    url_str = file_data.removeprefix("@")
 
                     if url_str.startswith(("http://", "https://")):
                         file_url_flag = True
@@ -880,7 +884,7 @@ class FileContentParser(BaseMessageParser):
                 )
                 if response_json:
                     # Handle list format response
-                    response_list = response_json.get("memory list", [])
+                    response_list = response_json["memory_list"]
                     memory_items = []
                     for item_data in response_list:
                         if not isinstance(item_data, dict):

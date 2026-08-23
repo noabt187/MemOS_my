@@ -9,6 +9,7 @@ from memos.graph_dbs.neo4j import (
     Neo4jGraphDB,
     _flatten_info_fields,
     _prepare_node_metadata,
+    _restore_neo4j_metadata,
     _sanitize_neo4j_metadata,
 )
 from memos.log import get_logger
@@ -1154,7 +1155,7 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
 
     def _parse_node(self, node_data: dict[str, Any]) -> dict[str, Any]:
         """Parse Neo4j node and optionally fetch embedding from vector DB."""
-        node = node_data.copy()
+        node = _restore_neo4j_metadata(node_data.copy())
 
         # Convert Neo4j datetime to string
         for time_field in ("created_at", "updated_at"):
@@ -1190,7 +1191,7 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
         parsed_nodes = []
         node_ids = []
         for node_data in nodes_data:
-            node = node_data.copy()
+            node = _restore_neo4j_metadata(node_data.copy())
 
             # Convert Neo4j datetime to string
             for time_field in ("created_at", "updated_at"):

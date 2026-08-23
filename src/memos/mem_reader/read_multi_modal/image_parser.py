@@ -6,8 +6,10 @@ import re
 from typing import TYPE_CHECKING, Any
 
 from memos.embedders.base import BaseEmbedder
+from memos.exceptions import ParserError
 from memos.llms.base import BaseLLM
 from memos.log import get_logger
+from memos.mem_reader.utils import validate_memory_extraction_result
 from memos.memories.textual.item import (
     SourceMessage,
     TextualMemoryItem,
@@ -27,6 +29,25 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 
+INLINE_IMAGE_PLACEHOLDER = "[inline image data omitted]"
+IMAGE_PROVENANCE_FIELDS = (
+    "source_path",
+    "filename",
+    "mime_type",
+    "file_size",
+    "sha256",
+    "source_recorded_at",
+    "source_type",
+    "media_uri",
+    "source_url",
+)
+
+
+def _is_inline_image_data(value: Any) -> bool:
+    """Return whether a value contains an inline image data URL."""
+    return isinstance(value, str) and value.lstrip().lower().startswith("data:image/")
+
+
 class ImageParser(BaseMessageParser):
     """Parser for image_url content parts."""
 
@@ -44,6 +65,8 @@ class ImageParser(BaseMessageParser):
         self,
         message: ChatCompletionContentPartImageParam,
         info: dict[str, Any],
+        *,
+        retain_inline_data: bool = True,
     ) -> SourceMessage:
         """Create SourceMessage from image_url content part."""
         if isinstance(message, dict):
@@ -51,11 +74,26 @@ class ImageParser(BaseMessageParser):
             if isinstance(image_url, dict):
                 url = image_url.get("url", "")
                 detail = image_url.get("detail", "auto")
-                image_info = image_url
+                image_info = dict(image_url)
+                for field in IMAGE_PROVENANCE_FIELDS:
+                    if field not in image_info and info.get(field) is not None:
+                        image_info[field] = info[field]
+
+                stored_url = url
+                if not retain_inline_data and _is_inline_image_data(url):
+                    stored_url = str(
+                        image_info.get("source_path")
+                        or image_info.get("media_uri")
+                        or image_info.get("source_url")
+                        or INLINE_IMAGE_PLACEHOLDER
+                    )
+                    image_info["url"] = stored_url
+                    image_info["inline_data_persisted"] = False
                 return SourceMessage(
                     type="image",
-                    content=url,
-                    url=url,
+                    content=stored_url,
+                    url=stored_url,
+                    image_path=image_info.get("source_path"),
                     detail=detail,
                     image_info=image_info,
                 )
@@ -82,17 +120,14 @@ class ImageParser(BaseMessageParser):
             or (source.content or "").replace("[image_url]: ", "")
         )
         detail = getattr(source, "detail", "auto")
-        image_id = ""
-        image_info = source.image_info
-        if image_info and isinstance(image_info, dict):
-            image_id = image_info.get("image_id")
+        image_info = dict(source.image_info or {})
+        image_info["url"] = url
+        image_info["detail"] = detail
+        if "image_id" in image_info:
+            image_info["image_id"] = str(image_info["image_id"])
         return {
             "type": "image_url",
-            "image_url": {
-                "url": url,
-                "detail": detail,
-                "image_id": str(image_id),
-            },
+            "image_url": image_info,
         }
 
     def parse_fast(
@@ -106,7 +141,12 @@ class ImageParser(BaseMessageParser):
             logger.warning(f"[ImageParser] Expected dict, got {type(message)}")
             return []
 
-        source = self.create_source(message, info)
+        retain_inline_data = bool(kwargs.get("transient_media_source", False))
+        source = self.create_source(
+            message,
+            info,
+            retain_inline_data=retain_inline_data,
+        )
         url = getattr(source, "url", None) or getattr(source, "content", "")
         if not url:
             logger.warning("[ImageParser] No image URL found in fast mode message")
@@ -115,7 +155,8 @@ class ImageParser(BaseMessageParser):
         info_ = info.copy()
         user_id = info_.pop("user_id", "")
         session_id = info_.pop("session_id", "")
-        content = f"[image_url]: {url}"
+        display_url = INLINE_IMAGE_PLACEHOLDER if _is_inline_image_data(url) else url
+        content = f"[image_url]: {display_url}"
         need_emb = kwargs.get("need_emb", True)
 
         return [
@@ -169,26 +210,37 @@ class ImageParser(BaseMessageParser):
         if isinstance(image_url, dict):
             url = image_url.get("url", "")
             detail = image_url.get("detail", "auto")
+            instruction = str(image_url.get("instruction", "")).strip()
         else:
             url = str(image_url)
             detail = "auto"
+            instruction = ""
 
         if not url:
             logger.warning("[ImageParser] No image URL found in message")
             return []
 
         # Create source for this image
-        source = self.create_source(message, info)
+        # The raw data URL is sent to the vision model above, but the final
+        # memory source stores only durable provenance such as source_path and
+        # sha256. This prevents multi-megabyte Base64 strings from entering the
+        # graph and vector databases.
+        source = self.create_source(message, info, retain_inline_data=False)
 
         # Get context items if available
         context_items = kwargs.get("context_items")
 
         # Determine language: prioritize lang from context_items,
         # fallback to kwargs
-        lang = kwargs.get("lang")
+        lang = detect_lang(instruction) if instruction else kwargs.get("lang")
         if context_items:
             for item in context_items:
-                if hasattr(item, "memory") and item.memory:
+                if (
+                    not instruction
+                    and hasattr(item, "memory")
+                    and item.memory
+                    and not item.memory.startswith("[image_url]:")
+                ):
                     lang = detect_lang(item.memory)
                     source.lang = lang
                     break
@@ -206,8 +258,14 @@ class ImageParser(BaseMessageParser):
         context_text = ""
         if context_items:
             for item in context_items:
-                if hasattr(item, "memory") and item.memory:
+                if (
+                    hasattr(item, "memory")
+                    and item.memory
+                    and not item.memory.startswith("[image_url]:")
+                ):
                     context_text += f"{item.memory}\n"
+        if instruction:
+            context_text += f"{instruction}\n"
         context_text = context_text.strip()
 
         # Inject context into prompt when possible
@@ -238,35 +296,21 @@ class ImageParser(BaseMessageParser):
                 return []
 
             # Parse JSON response
-            response_json = self._parse_json_result(response_text)
+            response_json = validate_memory_extraction_result(
+                self._parse_json_result(response_text),
+                context="image extraction",
+            )
             if not response_json:
                 logger.warning(f"[ImageParser] Fail to parse response from LLM: {response_text}")
                 return []
 
             # Extract memory items from response
             memory_items = []
-            memory_list = response_json.get("memory list", [])
+            memory_list = response_json["memory_list"]
 
             if not memory_list:
                 logger.warning("[ImageParser] No memory items extracted from image")
-                # Fallback: create a simple memory item with the summary
-                summary = response_json.get(
-                    "summary", "Image analyzed but no specific memories extracted."
-                )
-                if summary:
-                    memory_items.append(
-                        self._create_memory_item(
-                            value=summary,
-                            info=info,
-                            memory_type="LongTermMemory",
-                            tags=["image", "visual"],
-                            key=_derive_key(summary),
-                            sources=[source],
-                            background=summary,
-                            **kwargs,
-                        )
-                    )
-                return memory_items
+                return []
 
             # Create memory items from parsed response
             for mem_data in memory_list:
@@ -313,22 +357,11 @@ class ImageParser(BaseMessageParser):
 
             return memory_items
 
+        except ParserError:
+            raise
         except Exception as e:
             logger.error(f"[ImageParser] Error processing image in fine mode: {e}")
-            # Fallback: create a simple memory item
-            fallback_value = f"Image analyzed: {url}"
-            return [
-                self._create_memory_item(
-                    value=fallback_value,
-                    info=info,
-                    memory_type="LongTermMemory",
-                    tags=["image", "visual"],
-                    key=_derive_key(fallback_value),
-                    sources=[source],
-                    background="Image processing encountered an error.",
-                    **kwargs,
-                )
-            ]
+            return []
 
     def _parse_json_result(self, response_text: str) -> dict:
         """
@@ -338,7 +371,7 @@ class ImageParser(BaseMessageParser):
         s = (response_text or "").strip()
 
         # Try to extract JSON from code blocks
-        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.I)
+        m = re.search(r"```(?:json)?\s*([\s\S]*?)```", s, flags=re.IGNORECASE)
         s = (m.group(1) if m else s.replace("```", "")).strip()
 
         # Find first {

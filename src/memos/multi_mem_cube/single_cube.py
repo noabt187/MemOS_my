@@ -21,6 +21,12 @@ from memos.mem_scheduler.schemas.task_schemas import (
     MEM_READ_TASK_LABEL,
 )
 from memos.memories.textual.item import TextualMemoryItem
+from memos.memories.textual.relationship import (
+    PersonalMemoryNormalizationResult,
+    PersonalMemoryNormalizer,
+    RelationshipUpdater,
+    select_event_info_llm,
+)
 from memos.multi_mem_cube.views import MemCubeView
 from memos.search import resolve_filter_for_cube, search_text_memories
 from memos.templates.mem_reader_prompts import PROMPT_MAPPING
@@ -729,12 +735,68 @@ class SingleCubeView(MemCubeView):
             memory for memory in flattened_local if memory.metadata.memory_type != "RawFileMemory"
         ]
 
+        # Convert first-pass candidates into the only two personal-memory outputs:
+        # complete event memories and contact updates. Invalid fragments are never
+        # written as standalone memories.
+        try:
+            normalization = PersonalMemoryNormalizer(
+                select_event_info_llm(self.mem_reader, add_req.messages),
+                self.naive_mem_cube.text_mem.embedder,
+            ).normalize(
+                mem_group,
+                user_id=add_req.user_id,
+                use_llm=extract_mode == "fine",
+                source_material=add_req.messages,
+            )
+            mem_group = normalization.events
+        except Exception:
+            self.logger.exception(
+                "[SingleCubeView] Failed to normalize personal memories; "
+                "unvalidated fragments will not be stored"
+            )
+            normalization = PersonalMemoryNormalizationResult(
+                events=[],
+                contact_updates=[],
+                discarded=[],
+            )
+            mem_group = []
+
         # Stage 3: write_db
         with timed_stage("add", "write_db", cube_id=self.cube_id) as ts_db:
             mem_ids_local: list[str] = self.naive_mem_cube.text_mem.add(
                 mem_group,
                 user_name=user_context.mem_cube_id,
             )
+
+            try:
+                relationship_updater = RelationshipUpdater(
+                    text_mem=self.naive_mem_cube.text_mem,
+                    llm=getattr(self.mem_reader, "general_llm", None),
+                )
+                relationship_ids = relationship_updater.process(
+                    memories=mem_group,
+                    memory_ids=mem_ids_local,
+                    user_id=add_req.user_id,
+                    user_name=user_context.mem_cube_id,
+                )
+                direct_relationship_ids = relationship_updater.process_contact_updates(
+                    normalization.contact_updates,
+                    user_id=add_req.user_id,
+                    user_name=user_context.mem_cube_id,
+                )
+                relationship_ids = list(
+                    dict.fromkeys([*relationship_ids, *direct_relationship_ids])
+                )
+                if relationship_ids:
+                    self.logger.info(
+                        "[SingleCubeView] Updated %s relationship summaries",
+                        len(relationship_ids),
+                    )
+            except Exception:
+                self.logger.exception(
+                    "[SingleCubeView] Failed to update relationship summaries; "
+                    "event memories remain stored"
+                )
 
             self.logger.info(
                 f"Added {len(mem_ids_local)} memories for user {add_req.user_id} "

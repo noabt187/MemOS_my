@@ -7,6 +7,7 @@ from memos.configs.mem_reader import StrategyStructMemReaderConfig
 from memos.configs.parser import ParserConfigFactory
 from memos.mem_reader.read_multi_modal import detect_lang
 from memos.mem_reader.simple_struct import SimpleStructMemReader
+from memos.mem_reader.utils import validate_memory_extraction_result
 from memos.parsers.factory import ParserFactory
 from memos.templates.mem_reader_prompts import (
     CUSTOM_TAGS_INSTRUCTION,
@@ -52,21 +53,26 @@ class StrategyStructMemReader(SimpleStructMemReader, ABC):
         messages = [{"role": "user", "content": prompt}]
         try:
             response_text = self.llm.generate(messages)
-            response_json = self.parse_json_result(response_text)
+            return validate_memory_extraction_result(
+                self.parse_json_result(response_text),
+                context="strategy extraction",
+            )
         except Exception as e:
             logger.error(f"[LLM] Exception during chat generation: {e}")
-            response_json = {
-                "memory list": [
-                    {
-                        "key": mem_str[:10],
-                        "memory_type": "UserMemory",
-                        "value": mem_str,
-                        "tags": [],
-                    }
-                ],
-                "summary": mem_str,
-            }
-        return response_json
+            return validate_memory_extraction_result(
+                {
+                    "memory_list": [
+                        {
+                            "key": mem_str[:10],
+                            "memory_type": "UserMemory",
+                            "value": mem_str,
+                            "tags": [],
+                        }
+                    ],
+                    "summary": mem_str,
+                },
+                context="strategy extraction fallback",
+            )
 
     def get_scene_data_info(self, scene_data: list, type: str) -> list[str]:
         """

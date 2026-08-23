@@ -780,7 +780,7 @@ class MemOSClient:
         model_name: str | None = None,
         knowledgebase_ids: list[str] | None = None,
         filter: dict[str, Any] | None = None,
-        add_message_on_answer: bool = True,
+        add_message_on_answer: bool = False,
         app_id: str | None = None,
         agent_id: str | None = None,
         async_mode: bool = True,

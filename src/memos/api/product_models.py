@@ -160,7 +160,10 @@ class ChatRequest(BaseRequest):
     max_tokens: int | None = Field(None, description="Max tokens to generate")
     temperature: float | None = Field(None, description="Temperature for sampling")
     top_p: float | None = Field(None, description="Top-p (nucleus) sampling parameter")
-    add_message_on_answer: bool = Field(True, description="Add dialogs to memory after chat")
+    add_message_on_answer: bool = Field(
+        False,
+        description="Whether to add dialogs to memory after chat (opt-in; disabled by default)",
+    )
     manager_user_id: str | None = Field(None, description="Manager User ID")
     project_id: str | None = Field(None, description="Project ID")
     relativity: float = Field(
@@ -270,7 +273,10 @@ class ChatCompleteRequest(BaseRequest):
     max_tokens: int | None = Field(None, description="Max tokens to generate")
     temperature: float | None = Field(None, description="Temperature for sampling")
     top_p: float | None = Field(None, description="Top-p (nucleus) sampling parameter")
-    add_message_on_answer: bool = Field(True, description="Add dialogs to memory after chat")
+    add_message_on_answer: bool = Field(
+        False,
+        description="Whether to add dialogs to memory after chat (opt-in; disabled by default)",
+    )
 
     base_prompt: str | None = Field(None, description="(Deprecated) Base prompt alias")
     moscube: bool = Field(
@@ -897,7 +903,10 @@ class APIChatCompleteRequest(BaseRequest):
     max_tokens: int | None = Field(None, description="Max tokens to generate")
     temperature: float | None = Field(None, description="Temperature for sampling")
     top_p: float | None = Field(None, description="Top-p (nucleus) sampling parameter")
-    add_message_on_answer: bool = Field(True, description="Add dialogs to memory after chat")
+    add_message_on_answer: bool = Field(
+        False,
+        description="Whether to add dialogs to memory after chat (opt-in; disabled by default)",
+    )
     manager_user_id: str | None = Field(None, description="Manager User ID")
     project_id: str | None = Field(None, description="Project ID")
     relativity: float = Field(

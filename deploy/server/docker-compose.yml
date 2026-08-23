@@ -1,0 +1,135 @@
+name: memos-server
+
+x-memos-build: &memos-build
+  context: ../..
+  dockerfile: deploy/server/Dockerfile.memos
+
+services:
+  memos:
+    image: memos-server:local
+    build: *memos-build
+    restart: unless-stopped
+    env_file:
+      - ../../.env
+    environment:
+      PYTHONPATH: /app/src:/app/scripts
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .server.env}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - private
+
+  companion:
+    image: memos-server:local
+    build: *memos-build
+    restart: unless-stopped
+    command:
+      - python
+      - /app/scripts/memos_frontend_api.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8011"
+      - --base-url
+      - http://memos:8000
+    env_file:
+      - ../../.env
+    environment:
+      PYTHONPATH: /app/src:/app/scripts
+      MEMOS_API_BASE_URL: http://memos:8000
+      MEMOS_TOPIC_STATE: /data/topic/topics.json
+      MEMOS_WEB_UPLOAD_DIR: /data/uploads
+      NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .server.env}
+    volumes:
+      - topic_data:/data/topic
+      - upload_data:/data/uploads
+    depends_on:
+      - memos
+    networks:
+      - private
+
+  frontend:
+    image: memos-frontend:local
+    build:
+      context: ../../../MemOS_frontend
+      dockerfile: Dockerfile.server
+    restart: unless-stopped
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3000"
+      MEMOS_API_BASE_URL: http://memos:8000
+      MEMOS_COMPANION_URL: http://companion:8011
+      NEXT_PUBLIC_SITE_URL: https://${PUBLIC_HOST:?Set PUBLIC_HOST in .server.env}
+      MEMOS_ACCESS_PASSWORD_HASH: ${MEMOS_ACCESS_PASSWORD_HASH:?Set MEMOS_ACCESS_PASSWORD_HASH in .server.env}
+      MEMOS_SESSION_SECRET: ${MEMOS_SESSION_SECRET:?Set MEMOS_SESSION_SECRET in .server.env}
+    depends_on:
+      - companion
+    networks:
+      - private
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in .server.env}
+      ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .server.env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - frontend
+    networks:
+      - private
+
+  neo4j:
+    image: neo4j:5.26.6
+    restart: unless-stopped
+    environment:
+      NEO4J_ACCEPT_LICENSE_AGREEMENT: "yes"
+      NEO4J_AUTH: neo4j/${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .server.env}
+    volumes:
+      - neo4j_data:/data
+      - neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+    networks:
+      - private
+
+  qdrant:
+    image: qdrant/qdrant:v1.15.3
+    restart: unless-stopped
+    environment:
+      QDRANT__SERVICE__HTTP_PORT: "6333"
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    networks:
+      - private
+
+volumes:
+  neo4j_data:
+  neo4j_logs:
+  qdrant_data:
+  topic_data:
+  upload_data:
+  caddy_data:
+  caddy_config:
+
+networks:
+  private:
+    driver: bridge

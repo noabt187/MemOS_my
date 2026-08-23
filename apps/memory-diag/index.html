@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>MemOS 检索异常诊断 · 链路可视化</title>
+<meta name="description" content="MemOS /product/search 返回空结果的完整链路诊断：写入正常、数据完好、两处坏节点触发反序列化失败。" />
+<script>
+  // 主题初始化：在首帧渲染前恢复上次选择，避免闪烁
+  try {
+    if (localStorage.getItem("memory-diag-theme") === "light") {
+      document.body.setAttribute("data-theme", "light");
+    }
+  } catch (e) { /* localStorage 不可用时保持默认深色 */ }
+</script>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body data-theme="dark">
+  <a class="skip-link" href="#main">跳到主要内容</a>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">🧠</span>
+        <span class="brand-text">MemOS · 检索异常诊断</span>
+        <button class="theme-toggle" id="themeToggle" type="button" aria-pressed="false"
+                aria-label="切换浅色/深色主题" title="切换浅色/深色主题">
+          <span class="theme-toggle-icon" aria-hidden="true">☀️</span>
+          <span class="theme-toggle-text">浅色</span>
+        </button>
+      </div>
+      <div class="topbar-meta">
+        <span class="badge badge--danger">检索链路故障</span>
+        <span class="badge badge--ok">数据完好无损</span>
+        <span class="snapshot-date" id="snapshotDate"></span>
+      </div>
+    </div>
+
+    <nav class="toc" aria-label="页面目录">
+      <span class="toc-label" aria-hidden="true">目录</span>
+      <ul class="toc-list">
+        <li><a href="#chainTitle">一、数据流链路</a></li>
+        <li><a href="#badNodesTitle">二、坏节点</a></li>
+        <li><a href="#timelineTitle">三、时间线</a></li>
+        <li><a href="#reproTitle">四、复现实验</a></li>
+        <li><a href="#compareTitle">五、Issue 对比</a></li>
+        <li><a href="#fixTitle">六、修复方案</a></li>
+        <li><a href="#conclusionTitle">七、结论</a></li>
+      </ul>
+    </nav>
+  </header>
+
+  <main id="main">
+    <!-- ===================== 概览 ===================== -->
+    <section class="hero" aria-labelledby="heroTitle">
+      <p class="eyebrow">诊断报告 · 链路追踪 · 2026-08-17</p>
+      <h1 id="heroTitle">检索为空 ≠ 记忆丢失</h1>
+      <p class="hero-lead">
+        <code>/product/search</code> 默认参数下<b>每次</b>都返回空结果（HTTP 200），
+        但记忆全部还在：<b>23 条记忆</b>完整保存在 Neo4j，<b>34 条向量</b>在 Qdrant。
+        根因是 2 个节点的 <code>internal_info</code> 以 JSON 字符串形式入库，
+        读取时触发 Pydantic 校验失败，异常被静默吞掉。
+      </p>
+      <dl class="metrics">
+        <div class="metric">
+          <dt>Neo4j 记忆节点</dt>
+          <dd>23 <small>条 · status=activated</small></dd>
+        </div>
+        <div class="metric">
+          <dt>Qdrant 向量</dt>
+          <dd>34 <small>条 · 1024 维 Cosine</small></dd>
+        </div>
+        <div class="metric">
+          <dt>坏节点</dt>
+          <dd class="metric--danger">2 <small>条 · internal_info 字符串化</small></dd>
+        </div>
+        <div class="metric">
+          <dt>可复现</dt>
+          <dd class="metric--danger">100% <small>· 默认参数必现空</small></dd>
+        </div>
+      </dl>
+    </section>
+
+    <!-- ===================== 链路图 ===================== -->
+    <section class="section" aria-labelledby="chainTitle">
+      <div class="section-head">
+        <h2 id="chainTitle">一、数据流链路：写通、读断</h2>
+        <p class="section-note">点击链路中的节点查看该环节说明；红色节点是故障点。</p>
+      </div>
+
+      <div class="chain">
+        <div class="chain-lane">
+          <h3 class="lane-title"><span class="dot dot--ok" aria-hidden="true"></span> 写入链路 · 正常 ✅</h3>
+          <ol class="chain-steps chain-steps--ok">
+            <li class="step" data-desc="POST /product/add → SingleCubeView._process_text_mem。终端 :remember / 对话回写都走这里。">
+              <span class="step-num">1</span>
+              <span class="step-body"><b>add 请求</b><small>/product/add · sync 模式</small></span>
+            </li>
+            <li class="step" data-desc="mem_reader.get_memory：LLM 抽取记忆 + universal_api 生成 1024 维向量。">
+              <span class="step-num">2</span>
+              <span class="step-body"><b>抽取 + 嵌入</b><small>qwen3.7-text-embedding</small></span>
+            </li>
+            <li class="step" data-desc="text_mem.add → graph_db.add_node：Neo4j 写 Memory 节点，Qdrant 写向量（vector_sync=success）。">
+              <span class="step-num">3</span>
+              <span class="step-body"><b>双写入库</b><small>Neo4j 节点 + Qdrant 向量</small></span>
+            </li>
+          </ol>
+          <p class="lane-verdict">实测：新增测试记忆后 Qdrant 34→35 立即生效 ✅</p>
+        </div>
+
+        <div class="chain-lane chain-lane--broken">
+          <h3 class="lane-title"><span class="dot dot--danger" aria-hidden="true"></span> 检索链路 · 断在反序列化 ❌</h3>
+          <ol class="chain-steps chain-steps--broken">
+            <li class="step" data-desc="POST /product/search → SearchHandler → SingleCubeView._fast_search。默认 dedup=&quot;mmr&quot; 会把 top_k 从 5 放大到 15。">
+              <span class="step-num">1</span>
+              <span class="step-body"><b>search 请求</b><small>dedup=mmr · top_k 5→15</small></span>
+            </li>
+            <li class="step" data-desc="embedder.embed([query]) → 1024 维查询向量（实测正常）。">
+              <span class="step-num">2</span>
+              <span class="step-body"><b>查询词嵌入</b><small>qwen3.7-text-embedding</small></span>
+            </li>
+            <li class="step" data-desc="Qdrant 按 user_name=default_cube + status=activated + vector_sync=success 过滤检索，命中正常（实测最高分 0.755）。">
+              <span class="step-num">3</span>
+              <span class="step-body"><b>向量检索</b><small>neo4j_vec_db · 命中 5+ 条</small></span>
+            </li>
+            <li class="step step--fault" data-desc="recall.py:516 用 TextualMemoryItem.from_dict() 反序列化命中节点。两个节点的 internal_info 是 JSON 字符串 → Pydantic ValidationError（dict_type）。">
+              <span class="step-num">4</span>
+              <span class="step-body"><b>反序列化 ✗</b><small>recall.py:516 ValidationError</small></span>
+            </li>
+            <li class="step" data-desc="_search_text 的裸 except Exception 把异常静默吞掉，返回 []。接口 200 + 空 text_mem，无任何报错日志可见。">
+              <span class="step-num">5</span>
+              <span class="step-body"><b>静默吞异常</b><small>HTTP 200 · text_mem: []</small></span>
+            </li>
+          </ol>
+          <p class="lane-verdict lane-verdict--danger">实测：dedup=no（top_k=5）可搜出 3 条；dedup=mmr（默认）必空 ✅ 复现</p>
+        </div>
+      </div>
+
+      <div class="callout callout--error" id="chainError" hidden>
+        <strong>实际报错（原样）：</strong>
+        <pre>pydantic_core._pydantic_core.ValidationError: 1 validation error for TextualMemoryItem
+metadata.internal_info
+  Input should be a valid dictionary [type=dict_type,
+  input_value='{"ingest_batch_id": "cc1fb154-5c68-4048-af54-c9b6b2cd5a6d"}',
+  input_type=str]</pre>
+      </div>
+    </section>
+
+    <!-- ===================== 坏节点 ===================== -->
+    <section class="section" aria-labelledby="badNodesTitle">
+      <div class="section-head">
+        <h2 id="badNodesTitle">二、两个"坏节点"（毒化检索窗口）</h2>
+        <p class="section-note">
+          2026-08-13 11:33:33（北京）写入，来自"分析睡眠状况"对话回写。
+          写入端 <code>neo4j.py:_sanitize_neo4j_metadata</code> 把嵌套 dict 用 <code>json.dumps</code> 字符串化，读端没有还原。
+        </p>
+      </div>
+
+      <div class="node-grid" id="badNodes">
+        <!-- rendered by app.js -->
+      </div>
+
+      <div class="callout callout--warn">
+        <strong>为什么"每条都搜不到"？</strong>
+        默认 <code>dedup=mmr</code> 把 <code>top_k</code> 放大到 15，候选窗口<b>必然</b>覆盖这两个节点——
+        只要它们进入候选集，整次检索的反序列化就抛异常 → 全部为空。
+        搜索睡眠类内容时尤其必现（坏节点本身就是睡眠记忆，永远排在候选最前面）。
+      </div>
+    </section>
+
+    <!-- ===================== 时间线 ===================== -->
+    <section class="section" aria-labelledby="timelineTitle">
+      <div class="section-head">
+        <h2 id="timelineTitle">三、时间线：为什么"当场能检索，重启后不行"</h2>
+        <p class="section-note">时间均为北京时间（UTC+8）。数据来自 Neo4j 节点 created_at。</p>
+      </div>
+      <ol class="timeline" id="timeline">
+        <!-- rendered by app.js -->
+      </ol>
+      <div class="callout callout--info">
+        <strong>重启无关数据完整性：</strong>记忆写入即同步落库（Neo4j / Qdrant 命名卷），
+        服务关闭（<code>lifecycle.py</code>）只做 scheduler 收尾，不做任何数据持久化。
+        重启前后数据完全一致——"当场能搜"是因为当时坏节点还没写入，与"是否完全入库"无关。
+      </div>
+    </section>
+
+    <!-- ===================== 复现实验 ===================== -->
+    <section class="section" aria-labelledby="reproTitle">
+      <div class="section-head">
+        <h2 id="reproTitle">四、复现实验（真实测量结果）</h2>
+        <p class="section-note">同一查询「杭州」，同一份数据，仅改变请求参数。</p>
+      </div>
+
+      <div class="repro">
+        <button class="repro-btn" data-case="default" aria-pressed="false">
+          ① 默认参数（dedup=mmr, rerank=true, relativity=0.45）
+        </button>
+        <button class="repro-btn" data-case="nodup" aria-pressed="false">
+          ② dedup=no（top_k=5, rerank=true, relativity=0.45）
+        </button>
+      </div>
+
+      <div class="repro-result" id="reproResult" aria-live="polite">
+        <p class="repro-hint">点击上方按钮查看对应结果。</p>
+      </div>
+    </section>
+
+    <!-- ===================== 根因对比 ===================== -->
+    <section class="section" aria-labelledby="compareTitle">
+      <div class="section-head">
+        <h2 id="compareTitle">五、与 GitHub Issue 对比：同一症状，不同病根</h2>
+      </div>
+      <div class="table-wrap">
+        <table class="compare-table">
+          <thead>
+            <tr>
+              <th scope="col">维度</th>
+              <th scope="col">GitHub Issue（Postgres/pgvector）</th>
+              <th scope="col">当前环境（Neo4j + Qdrant）</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr><td>后端</td><td><code>GRAPH_DB_BACKEND=postgres</code>，向量在 pgvector 列</td><td><code>NEO4J_BACKEND=neo4j-community</code>，向量在 Qdrant</td></tr>
+            <tr><td>出问题字段</td><td><code>metadata.embedding</code>（期望 <code>list[float]</code>）</td><td><code>metadata.internal_info</code>（期望 <code>dict</code>）</td></tr>
+            <tr><td>错误类型</td><td><code>list_type</code>（psycopg2 把 pgvector 当字符串返回）</td><td><code>dict_type</code>（写库端 <code>_sanitize_neo4j_metadata</code> 字符串化嵌套 dict）</td></tr>
+            <tr><td>失败位置</td><td colspan="2" class="col-mid">完全一致：<code>recall.py:516</code> → <code>TextualMemoryItem.from_dict()</code> → 被 <code>_search_text</code> 吞掉 → <code>text_mem: []</code></td></tr>
+            <tr><td>对当前环境</td><td colspan="2" class="col-mid">❌ 不适用——本环境的向量从 Qdrant 读回本就是正常的 <code>list</code>；postgres.py 根本不执行</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="section-note">
+        两个 issue 同属一类设计缺口：<b>写入端 / 驱动把字段字符串化，读端不宽容还原</b>。
+        可统一给各后端行解析加字段还原逻辑，一次覆盖 <code>postgres.embedding</code> 与 <code>neo4j.internal_info</code>。
+      </p>
+    </section>
+
+    <!-- ===================== 修复方案 ===================== -->
+    <section class="section" aria-labelledby="fixTitle">
+      <div class="section-head">
+        <h2 id="fixTitle">六、修复方案</h2>
+      </div>
+      <div class="tabs" role="tablist" aria-label="修复方案">
+        <button class="tab" id="tab-data" role="tab" aria-selected="true" aria-controls="panel-data">① 数据修复（最快）</button>
+        <button class="tab" id="tab-code" role="tab" aria-selected="false" aria-controls="panel-code">② 代码修复（治本）</button>
+        <button class="tab" id="tab-view" role="tab" aria-selected="false" aria-controls="panel-view">③ 查看全部记忆</button>
+      </div>
+
+      <div class="tab-panel" id="panel-data" role="tabpanel" aria-labelledby="tab-data">
+        <p>清掉 / 还原两个节点的字符串 <code>internal_info</code>，检索立即恢复，无需改代码。在 Neo4j Browser（<code>http://localhost:7474</code>，neo4j / 12345678）执行：</p>
+        <div class="codeblock">
+          <button class="copy-btn" data-copy-target="cypher1" type="button">复制</button>
+          <pre id="cypher1">MATCH (n:Memory)
+WHERE n.internal_info IS NOT NULL AND toString(n.internal_info) STARTS WITH '{'
+SET n.internal_info = null
+RETURN n.id, n.memory_type</pre>
+        </div>
+        <p class="section-note">两个目标节点：<code>688b4c53-3fd4-42ad-a963-9bfb6da46210</code>、<code>8a433b4f-9c44-45a7-9de2-cc6346131016</code>。</p>
+      </div>
+
+      <div class="tab-panel" id="panel-code" role="tabpanel" aria-labelledby="tab-code" hidden>
+        <ul class="fix-list">
+          <li><b>读端还原（推荐）</b>：构造 <code>TextualMemoryItem</code> 前把 <code>internal_info</code> 反解析回 dict——参考 <code>dream/contextualization.py</code> 已有的 <code>_coerce_json_dict</code>；可同时覆盖 <code>postgres.embedding</code> 的字符串问题。</li>
+          <li><b>写端止损</b>：<code>src/memos/graph_dbs/neo4j.py:_sanitize_neo4j_value</code> 不再把嵌套 dict 用 <code>json.dumps</code> 字符串化（Neo4j 原生支持 map 属性）。</li>
+          <li><b>可观测性</b>：<code>single_cube.py:_search_text</code> 的裸 <code>except Exception: return []</code> 应记录异常（logger.exception），避免下次再静默吞错。</li>
+        </ul>
+        <div class="codeblock">
+          <button class="copy-btn" data-copy-target="codefix1" type="button">复制</button>
+          <pre id="codefix1"># 读端还原 internal_info 的参考模式（_coerce_json_dict 位于 dream/contextualization.py）
+import json, ast
+
+def _coerce_json_dict(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (ValueError, TypeError):
+            try:
+                parsed = ast.literal_eval(value)
+            except (ValueError, SyntaxError):
+                return None
+        return parsed if isinstance(parsed, dict) else None
+    return None</pre>
+        </div>
+      </div>
+
+      <div class="tab-panel" id="panel-view" role="tabpanel" aria-labelledby="tab-view" hidden>
+        <p>记忆没有丢，以下方式可查看全部内容：</p>
+        <div class="codeblock">
+          <button class="copy-btn" data-copy-target="view1" type="button">复制</button>
+          <pre id="view1"># 全部记忆（组装成树，23 条）
+curl -X POST http://127.0.0.1:8000/product/get_all -H "Content-Type: application/json" \
+  -d '{"user_id":"default","mem_cube_ids":["default_cube"],"memory_type":"text_mem"}'
+
+# 全部记忆（平铺 + 完整元数据）
+curl -X POST http://127.0.0.1:8000/product/get_memory -H "Content-Type: application/json" \
+  -d '{"user_id":"default","mem_cube_id":"default_cube","page":1,"page_size":50}'
+
+# 直接查 Neo4j（浏览器打开 http://localhost:7474，neo4j / 12345678）
+# MATCH (n:Memory) RETURN n.id, n.memory, n.memory_type, n.created_at ORDER BY n.created_at
+
+# 直接查 Qdrant 向量
+# GET http://localhost:6333/collections/neo4j_vec_db</pre>
+        </div>
+        <p class="section-note">注意：<code>get_all</code> 用的是 <code>mem_cube_ids</code>（复数），不是 <code>readable_cube_ids</code>，用错会静默回退到 user_id 导致看似"空"。</p>
+      </div>
+    </section>
+
+    <!-- ===================== 结论 ===================== -->
+    <section class="section" aria-labelledby="conclusionTitle">
+      <div class="section-head">
+        <h2 id="conclusionTitle">七、结论</h2>
+      </div>
+      <ul class="conclusion-list">
+        <li>✅ <b>数据未丢失</b>：23 条记忆 + 34 条向量完好（本页所有数字均为实测）。</li>
+        <li>✅ <b>写入链路正常</b>：add → 抽取 → 嵌入 → Neo4j+Qdrant 双写，实测 34→35 立即生效。</li>
+        <li>❌ <b>检索链路被 2 个坏节点毒化</b>：<code>internal_info</code> 字符串化 → 默认 <code>dedup=mmr</code> 放大 top_k 必然命中 → Pydantic 校验失败 → 异常被吞 → 空结果。</li>
+        <li>🔧 <b>恢复方式</b>：执行上面 Cypher 清掉坏字段即可立即恢复；长期建议代码修复 + 不再静默吞异常。</li>
+      </ul>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>MemOS 检索异常诊断 · 数据快照 2026-08-17（本地实测） · 页面为静态诊断报告，不含真实敏感内容。</p>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

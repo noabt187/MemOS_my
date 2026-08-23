@@ -23,7 +23,7 @@ For example, write "The user felt exhausted..." instead of "I felt exhausted..."
 Return a single valid JSON object with the following structure:
 
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <string, a unique, concise memory title>,
       "memory_type": <string, Either "LongTermMemory" or "UserMemory">,
@@ -52,7 +52,7 @@ user: [June 26, 2025 at 4:21 PM]: Good idea. I’ll raise it in tomorrow’s 9:3
 
 Output:
 {
-  "memory list": [
+  "memory_list": [
     {
         "key": "Initial project meeting",
         "memory_type": "LongTermMemory",
@@ -75,7 +75,7 @@ indeed very suitable for your current situation. The book explains … (omitted)
 
 Output:
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "Deep Work Book Recommendation",
       "memory_type": "LongTermMemory",
@@ -91,7 +91,7 @@ Note: When the dialogue contains only assistant messages, phrasing such as
 
 Another Example in Chinese (注意: 当user的语言为中文时，你就需要也输出中文)：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "项目会议",
       "memory_type": "LongTermMemory",
@@ -138,7 +138,7 @@ SIMPLE_STRUCT_MEM_READER_PROMPT_ZH = """您是记忆提取专家。
 返回一个有效的JSON对象，结构如下：
 
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <字符串，唯一且简洁的记忆标题>,
       "memory_type": <字符串，"LongTermMemory" 或 "UserMemory">,
@@ -166,7 +166,7 @@ user: [2025年6月26日下午4:21]：好主意。我明天上午9:30的会上提
 
 输出：
 {
-  "memory list": [
+  "memory_list": [
     {
         "key": "项目初期会议",
         "memory_type": "LongTermMemory",
@@ -190,7 +190,7 @@ assistant: [2025年8月15日上午10:30]:
 
 输出：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "深度工作书籍推荐",
       "memory_type": "LongTermMemory",
@@ -204,7 +204,7 @@ assistant: [2025年8月15日上午10:30]:
 
 另一个中文示例（注意：当用户语言为中文时，您也需输出中文）：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "项目会议",
       "memory_type": "LongTermMemory",
@@ -256,7 +256,7 @@ Please perform:
 Return a single valid JSON object with the following structure:
 
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <string, a concise title of the `value` field>,
       "memory_type": "LongTermMemory",
@@ -315,7 +315,7 @@ SIMPLE_STRUCT_DOC_READER_PROMPT_ZH = """您是搜索与检索系统的文本分�
 返回有效的 JSON 对象：
 
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <字符串，`value` 字段的简洁标题>,
       "memory_type": "LongTermMemory",
@@ -345,7 +345,7 @@ SIMPLE_STRUCT_DOC_READER_PROMPT_ZH = """您是搜索与检索系统的文本分�
 
 输出：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "亲属名词在所有格构式中的不一致行为",
       "memory_type": "LongTermMemory",
@@ -423,7 +423,7 @@ Please perform the following steps:
 Return a valid JSON object with the following structure:
 
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <string, a concise and unique memory title>,
       "memory_type": "LongTermMemory",
@@ -452,7 +452,7 @@ In addition, the clitic =kin encodes a range of associative relations, including
 
 Output:
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "Asymmetric possessive behavior of kinship terms",
       "memory_type": "LongTermMemory",
@@ -505,6 +505,15 @@ GENERAL_STRUCT_STRING_READER_PROMPT_ZH = """您是搜索与检索系统的文本
    - 如果两条记忆表达的是同一事实或同一判断，只保留信息更完整的一条。
    - 不允许仅通过措辞变化来制造“不同”的记忆。
 2.4 记忆条数不设固定上限或下限，应由文档信息密度自然决定。
+2.5 对按时间顺序描述用户活动的时间流文档，应尊重原文已经给出的时间边界，不依赖特定编号、标题、列表或表格格式：
+   - 通过明确的开始时间、结束时间、时间范围、时间点以及原文的活动记录边界识别时间段。
+   - 每个明确划分的时间段或时间点活动记录必须且只能对应 `memory_list` 中的一条记忆。
+   - 不得合并、遗漏不同的时间段，也不得将同一条明确时间段记录再次拆成多条；不得因为相邻记录使用同一应用或涉及同一主题而合并。
+   - 严格按照原始时间顺序输出。如果原文为多个活动分别给出了时间边界，输出记忆数量应与这些有证据的活动记录数量一致。
+   - 每条 `value` 必须以完整日期、开始时间和结束时间开头；只有时间点而没有结束时间时，应保留原有时间精度，不得编造结束时间。
+   - 保留该时间段中明确给出的应用、行为、对象、内容和持续时长。原文有活动编号时，可以将编号保留在 `key` 中方便回查，但不得依赖编号判断是否属于时间流。
+   - 无记录、未知、空白或缺失数据的时间段不能被改写成已观察到的用户行为。
+   - 不得用全天概览、平台使用总结或主题总结替代逐时间段记忆；`summary` 只能作为补充，不能代替 `memory_list`。
 3. 信息解析要求
 3.1 识别并明确所有重要的：
    - 时间（区分事件发生时间与文档记录时间）
@@ -522,7 +531,7 @@ GENERAL_STRUCT_STRING_READER_PROMPT_ZH = """您是搜索与检索系统的文本
 
 返回一个有效的 JSON 对象，结构如下：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <字符串，简洁且唯一的记忆标题>,
       "memory_type": "LongTermMemory",
@@ -557,7 +566,7 @@ user: [June 26, 2025 at 4:21 PM]: Good idea. I’ll raise it in tomorrow’s 9:3
 
 Output:
 {
-  "memory list": [
+  "memory_list": [
     {
         "key": "Initial project meeting",
         "memory_type": "LongTermMemory",
@@ -576,7 +585,7 @@ Output:
 
 Another Example in Chinese (注意: 当user的语言为中文时，你就需要也输出中文)：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "项目会议",
       "memory_type": "LongTermMemory",
@@ -600,7 +609,7 @@ user: [2025年6月26日下午4:21]：好主意。我明天上午9:30的会上提
 
 输出：
 {
-  "memory list": [
+  "memory_list": [
     {
         "key": "项目初期会议",
         "memory_type": "LongTermMemory",
@@ -619,7 +628,7 @@ user: [2025年6月26日下午4:21]：好主意。我明天上午9:30的会上提
 
 另一个中文示例（注意：当用户语言为中文时，您也需输出中文）：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "项目会议",
       "memory_type": "LongTermMemory",
@@ -653,7 +662,7 @@ Please extract:
 
 Return a valid JSON object with the following structure:
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <string, a unique and concise memory title>,
       "memory_type": <string, "LongTermMemory" or "UserMemory">,
@@ -676,7 +685,7 @@ role-Bob: Me too
 
 Image URL to be analyzed: https://xxxxxx.jpg
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "Cylindrical Carry-On Item Attached to Hiking Backpack",
       "memory_type": "LongTermMemory",
@@ -710,7 +719,7 @@ IMAGE_ANALYSIS_PROMPT_ZH = """您是一个智能记忆助手。请根据上下�
 
 返回一个有效的 JSON 对象，格式如下：
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": <字符串，一个唯一且简洁的记忆标题>,
       "memory_type": <字符串，"LongTermMemory" 或 "UserMemory">,
@@ -733,7 +742,7 @@ role-bob: 我也是
 
 待解析的url：https://xxxxxx.jpg
 {
-  "memory list": [
+  "memory_list": [
     {
       "key": "徒步背包侧挂圆柱形随行物品",
       "memory_type": "LongTermMemory",
@@ -755,6 +764,199 @@ role-bob: 我也是
 {context}
 
 专注于从图像中提取事实性、可观察的信息。除非与用户记忆明显相关，否则避免推测。
+"""
+
+
+INTERLEAVED_MEDIA_ANALYSIS_PROMPT_EN = """You are an intelligent memory assistant for jointly understanding ordered text and images.
+
+Each input part has a unique `part_id` and appears in the user's original order. Treat the entire sequence as one or more events. Do not analyze text and images as unrelated inputs.
+
+Sequence and evidence rules:
+1. Earlier text may provide people, places, time, purpose, or references for later images. Later text may supplement, correct, or start a new event.
+2. Adjacent images may show one continuous event or state change. Do not create one memory per image.
+3. The same topic does not mean the same event. Separate events with different dates, time ranges, actions, or outcomes.
+4. Never backfill a date from a later event into an earlier event that has no date.
+5. Records from different dates must be separate memories. Resolve relative expressions such as "the next day" only from explicit nearby evidence.
+6. If text and an image appear to conflict, first check whether they refer to different dates or events. Do not label one as the "actual" value without evidence.
+7. Use only supplied text and visible image evidence. Preserve uncertainty and never invent unsupported precision.
+
+Memory rules:
+1. Split the result into independent, non-duplicate, self-contained memories, each expressing one main fact, event, decision, plan, background, or explicit attitude.
+2. Determine memory count from facts, not from the number of input parts.
+3. Merge consecutive browsing or interface steps into one activity unless they represent different goals or outcomes.
+4. Use third-person, accurate, neutral language.
+5. Every memory must list only the `evidence_part_ids` that actually support it.
+6. Confidence is a number from 0 to 1. Inferred time or identity cannot have confidence 1.
+7. Return valid JSON only, without Markdown or explanations.
+
+Output schema:
+{
+  "sequence_groups": [
+    {
+      "part_ids": ["part_001", "part_002"],
+      "relationship": "why these parts form one event",
+      "summary": "short joint understanding"
+    }
+  ],
+  "memory_list": [
+    {
+      "key": "concise unique title",
+      "memory_type": "LongTermMemory or UserMemory",
+      "value": "complete self-contained memory",
+      "tags": ["keyword"],
+      "evidence_part_ids": ["part_001", "part_002"],
+      "confidence": 0.0
+    }
+  ],
+  "summary": "overall sequence summary",
+  "uncertainties": ["unsupported or unresolved information"]
+}"""
+
+
+INTERLEAVED_MEDIA_ANALYSIS_PROMPT_ZH = """您是一个负责联合理解有序文字和图片的智能记忆助手。
+
+每个输入项都有唯一的 `part_id`，并严格按照用户原始输入顺序排列。请把完整序列理解为一个或多个事件，不要把文字和图片当成互不相关的输入分别总结。
+
+顺序与证据规则：
+1. 前面的文字可能为后面的图片提供人物、地点、时间、目的或指代信息；后面的文字可能补充、纠正或开始一个新事件。
+2. 相邻图片可能展示同一事件或连续状态变化。不要机械地为每张图片生成一条记忆。
+3. 相同主题不代表同一个事件。日期、时间范围、行为或结果不同的内容必须分开。
+4. 不得把后文日期倒推给前面没有日期的事件。
+5. 不同日期的记录必须拆成不同记忆。“第二天”“后来”等相对时间只能根据相邻的明确证据解析。
+6. 文字与图片看似冲突时，先检查它们是否属于不同日期或不同事件。没有证据时，不得把其中一个说成“实际值”。
+7. 只依据输入文字和图片中的可见证据。证据不足时保留不确定性，不制造虚假精度。
+
+记忆提取规则：
+1. 将结果拆成相互独立、尽量不重复、可以单独理解的记忆。每条只表达一个主要事实、事件、决定、计划、背景或明确态度。
+2. 按事实数量决定记忆条数，不按输入项数量决定。
+3. 连续浏览或界面切换默认合并为一次完整活动，除非目标或结果已经改变。
+4. 使用第三人称、准确、中性的中文表达。
+5. 每条记忆只能列出真正支持它的 `evidence_part_ids`。
+6. `confidence` 使用0到1的数字。推断得到的时间或身份不能标为1。
+7. 只输出有效JSON，不要输出Markdown、代码围栏或额外解释。
+
+输出结构：
+{
+  "sequence_groups": [
+    {
+      "part_ids": ["part_001", "part_002"],
+      "relationship": "这些输入项为什么属于同一事件",
+      "summary": "该事件的简短联合理解"
+    }
+  ],
+  "memory_list": [
+    {
+      "key": "简洁且唯一的记忆标题",
+      "memory_type": "LongTermMemory 或 UserMemory",
+      "value": "完整、清晰、可独立理解的记忆描述",
+      "tags": ["关键词"],
+      "evidence_part_ids": ["part_001", "part_002"],
+      "confidence": 0.0
+    }
+  ],
+  "summary": "整组图文的整体总结",
+  "uncertainties": ["证据不足或无法确定的内容"]
+}"""
+
+
+VIDEO_ANALYSIS_PROMPT_EN = """You are an intelligent memory assistant. Please analyze the provided video based on the contextual information (if any) and extract meaningful information that should be remembered.
+
+Highest-priority time requirements:
+1. Every `value` must start with a timestamp in `[YYYY-MM-DD HH:MM]` form.
+2. The source recording/import reference time is `{source_recorded_at}`.
+3. For each event, use OCR to read the closest visible phone status-bar or in-app time. Use an explicitly visible full date when present; otherwise combine the date from the supplied reference time with the visible OCR hour and minute.
+4. If the screen time cannot be read reliably, use the reference time and mark the prefix as `[YYYY-MM-DD HH:MM (reference time)]`. Never invent a minute unsupported by either the screen or the reference time.
+
+Please extract:
+1. **Visual Content**: What applications, pages, controls, text, objects, or scenes are visible over time?
+2. **Key Actions and Results**: What user actions are supported by observable changes between earlier and later frames, and what visible results follow?
+3. **User Relevance**: What facts, tasks, choices, or explicit behaviors might be relevant to the user's memory?
+
+Video-specific rules:
+1. Treat the frames as a chronological sequence and use state changes across frames as evidence.
+2. For mobile screen recordings, focus on the application or page, the target control, the observable action, and the visible result. Faces and audio are not required.
+3. Describe clicks, typing, selections, swipes, or navigation only when the visual evidence supports them. Otherwise, describe only the observed state transition and do not guess the hidden gesture or control.
+4. Merge consecutive identical or highly repetitive frames. Do not create one memory per frame.
+5. Combine consecutive steps that belong to one task into a complete behavior. Separate different tasks or outcomes into different memories.
+6. A single video proves only the behavior observed in this recording. Do not infer a stable habit, preference, or repeated pattern from one recording.
+7. Use third-person wording and rely only on the video and supplied context. Do not invent unobserved details.
+8. Return only valid JSON without Markdown, code fences, or explanations.
+
+Return a valid JSON object with the following structure:
+{
+  "memory_list": [
+    {
+      "key": <string, a unique and concise memory title>,
+      "memory_type": <string, "LongTermMemory" or "UserMemory">,
+      "value": <a detailed, self-contained description of what should be remembered from the video>,
+      "tags": <a list of relevant keywords>
+    },
+    ...
+  ],
+  "summary": <a natural paragraph summarizing the video's main behaviors and visible results>
+}
+
+Language rules:
+- The `key`, `value`, `tags`, and `summary` fields must match the language of the user's context if available; otherwise use English.
+- Keep `memory_type` in English.
+- Use `UserMemory` for the user's observable actions, choices, and tasks. Use `LongTermMemory` for objective external facts when appropriate.
+
+If context is provided, incorporate it into the extraction. If no context is given, extract only observable information from the video.
+Reference context:
+{context}
+
+Focus on factual, observable information. Avoid speculation unless it is explicitly supported by the context.
+"""
+
+
+VIDEO_ANALYSIS_PROMPT_ZH = """您是一个智能记忆助手。请根据上下文信息（如有）分析提供的视频并提取应该被记住的有意义信息。
+
+时间要求（最高优先级）：
+1. 每条 `value` 必须以时间戳开头，格式为 `[YYYY-MM-DD HH:MM]`。
+2. 视频录制/导入参考时间为 `{source_recorded_at}`。
+3. 对每个事件优先通过 OCR 读取最接近该画面的手机状态栏时间或应用内时间；画面有完整日期时优先使用画面日期，否则将参考时间中的日期与 OCR 识别出的时、分组合。
+4. 如果无法可靠读取画面时间，使用参考时间，并明确写成 `[YYYY-MM-DD HH:MM（参考时间）]`。不得编造画面和参考时间都不能支持的分钟数。
+5. 同一个连续事件使用最接近事件开始画面的时间；如果事件跨越多个可识别时间点，可在正文中补充结束时间。
+
+请提取：
+1. **视觉内容**：视频中按时间顺序可见的应用、页面、控件、文字、物体或场景是什么？
+2. **关键行为与结果**：哪些用户操作能够被前后画面的变化支持？操作对象和可见结果是什么？
+3. **用户相关性**：视频中的哪些事实、任务、选择或明确行为可能与用户的记忆相关？
+
+视频特定规则：
+1. 将视频帧视为按时间排列的连续序列，结合前后画面的状态变化判断操作过程。
+2. 对手机录屏，重点识别“应用或页面—操作对象—可见动作—可见结果”，不要求出现人脸或声音。
+3. 只有在视觉证据足够时，才描述用户进行了点击、输入、选择、滑动或返回等操作。如果只能观察到页面变化，应只描述可见的状态变化，不猜测隐藏的手势或控件。
+4. 合并连续相同或高度重复的画面，不要为每一帧重复生成记忆。
+5. 将属于同一个任务的连续步骤组织成一个完整行为；不同任务或不同结果分别生成记忆。
+6. 单段视频只能证明用户在本次录屏中的行为，不得据此推断稳定习惯、偏好或重复模式。
+7. 始终使用第三人称，只依据视频和给定上下文提取信息，不补充不可见内容。
+8. 只输出有效 JSON，不输出 Markdown、代码块或解释。
+
+返回一个有效的 JSON 对象，格式如下：
+{
+  "memory_list": [
+    {
+      "key": <字符串，一个唯一且简洁的记忆标题>,
+      "memory_type": <字符串，"LongTermMemory" 或 "UserMemory">,
+      "value": <一个详细、自包含的描述，说明应该从视频中记住什么>,
+      "tags": <相关关键词列表>
+    },
+    ...
+  ],
+  "summary": <一个自然段落，总结视频中的主要行为和可见结果>
+}
+
+语言规则：
+- `key`、`value`、`tags` 和 `summary` 字段应该与用户上下文的语言匹配（如果可用），否则使用中文。
+- `memory_type` 保持英文。
+- 与用户可观察行为、选择和任务有关的记忆使用 `UserMemory`；客观外部事实可以使用 `LongTermMemory`。
+
+如果给定了上下文，就结合上下文信息进行提取；如果没有上下文，只提取视频中可观察的信息。
+参考的上下文：
+{context}
+
+专注于从视频中提取事实性、可观察的信息。除非上下文明示，否则避免推测。
 """
 
 
