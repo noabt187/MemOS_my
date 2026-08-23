@@ -75,7 +75,7 @@ services:
       - private
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy:2.11.4-alpine
     restart: unless-stopped
     environment:
       PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in .server.env}
