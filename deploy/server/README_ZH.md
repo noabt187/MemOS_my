@@ -1,190 +1,159 @@
-# MemOS 服务器部署（47.99.110.248）
+# MemOS 服务器部署
 
-这套配置会启动六个服务：MemOS、Neo4j、Qdrant、Topic 连接服务、认证前端和 Caddy HTTPS 网关。
+本目录用于把 MemOS 部署为一套 HTTPS 服务。部署包含：
 
-公网只开放 `80` 和 `443`。`8000`、`8011`、`6333`、`6334`、`7474`、`7687` 都不能加入阿里云安全组。
+- Caddy：提供 HTTPS、静态前端和反向代理
+- 应用后端：认证、上传、Topic 和 `/api/v1`
+- MemOS：记忆解析、存储与检索
+- Neo4j：图数据存储
+- Qdrant：向量数据存储
 
-## 1. 准备服务器
+公网只需要开放 80 和 443。MemOS、应用后端和数据库均位于 Docker 私有网络中。
 
-推荐 Ubuntu 24.04 LTS，至少 4 核、16 GB 内存和 50 GB 可用磁盘。
+## 服务器要求
 
-在阿里云安全组中只添加：
+- 推荐 Ubuntu 24.04 LTS
+- Docker Engine 和 Docker Compose Plugin
+- 至少 4 核 CPU、16 GB 内存和 50 GB 可用磁盘
+- 一个域名，或支持公开访问的服务器 IP
+- 已构建的 `MemOS_frontend/dist` 静态文件
 
-- TCP 22：来源限制为你自己的公网 IP。
-- TCP 80：来源 `0.0.0.0/0`。
-- TCP 443：来源 `0.0.0.0/0`。
+安全组建议：
 
-登录服务器：
+| 端口 | 用途 | 来源 |
+| --- | --- | --- |
+| 22 | SSH | 仅管理员 IP |
+| 80 | HTTP 与证书签发 | 公网 |
+| 443 | HTTPS | 公网 |
 
-```bash
-ssh root@47.99.110.248
-cat /etc/os-release
+不要开放 8000、8011、6333、6334、7474 或 7687。
+
+## 目录结构
+
+建议把两个仓库放在同一目录：
+
+```text
+/opt/memos-stack/
+├─ MemOS/
+└─ MemOS_frontend/
 ```
 
-下面的安装命令只适用于 Ubuntu。若输出是 Alibaba Cloud Linux、CentOS 或其他系统，请先停止并按对应系统安装 Docker。
-
-## 2. 安装 Docker
+## 1. 准备 MemOS 配置
 
 ```bash
-sudo apt update
-sudo apt install -y ca-certificates curl
-sudo install -m 0755 -d /etc/apt/keyrings
-sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
-sudo chmod a+r /etc/apt/keyrings/docker.asc
-
-cat <<EOF | sudo tee /etc/apt/sources.list.d/docker.sources
-Types: deb
-URIs: https://download.docker.com/linux/ubuntu
-Suites: $(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-Components: stable
-Architectures: $(dpkg --print-architecture)
-Signed-By: /etc/apt/keyrings/docker.asc
-EOF
-
-sudo apt update
-sudo apt install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-sudo systemctl enable --now docker
-sudo docker run --rm hello-world
+cd /opt/memos-stack/MemOS
+cp docker/.env.example .env
+chmod 600 .env
 ```
 
-## 3. 从 Windows 上传当前代码
+编辑 `.env`，填写文本模型、记忆解析模型和 Embedding 配置。需要视频解析时，再填写视频模型和 OSS 配置。
 
-这里不能重新克隆官方仓库，因为当前项目包含你已经做过的 Topic、图片、视频和认证改动。
-
-在 Windows PowerShell 中执行：
+生产环境必须启用登录保护。可以在可信的管理电脑上执行：
 
 ```powershell
-cd D:\project-memo
-
-tar.exe -czf memos-stack.tar.gz `
-  --exclude=MemOS/.git `
-  --exclude=MemOS/.venv `
-  --exclude=MemOS/.memos `
-  --exclude=MemOS/.env `
-  --exclude=MemOS_frontend/.git `
-  --exclude=MemOS_frontend/node_modules `
-  --exclude=MemOS_frontend/.env.local `
-  --exclude=MemOS_frontend/dist `
-  --exclude=MemOS_frontend/.vinext `
-  MemOS MemOS_frontend
-
-scp .\memos-stack.tar.gz root@47.99.110.248:/tmp/
-scp .\MemOS\.env root@47.99.110.248:/tmp/memos.env
+.\scripts\set_memos_access_password.ps1
 ```
 
-回到服务器执行：
+然后通过安全方式把生成的 `.env` 传到服务器。也可以在已安装 `uv` 的服务器上执行：
 
 ```bash
-sudo mkdir -p /opt/memos-stack
-sudo tar -xzf /tmp/memos-stack.tar.gz -C /opt/memos-stack
-sudo mv /tmp/memos.env /opt/memos-stack/MemOS/.env
-sudo chmod 600 /opt/memos-stack/MemOS/.env
+uv run --frozen python scripts/memos_app_auth.py
 ```
 
-确认 `/opt/memos-stack/MemOS/.env` 中已经填写真实模型和向量模型配置，不能保留 `you_bailian_api_key`。
+## 2. 构建前端
 
-## 4. 配置服务器密码
-
-先在 Windows 上运行：
-
-```powershell
-cd D:\project-memo\MemOS_frontend
-.\change-password.ps1 -NoRestart
+```bash
+cd /opt/memos-stack/MemOS_frontend
+npm ci
+npm run build
 ```
 
-然后在服务器创建配置：
+构建结果位于 `MemOS_frontend/dist`。生产环境只需要这些静态文件，不运行 Node 服务。
+
+## 3. 准备部署变量
 
 ```bash
 cd /opt/memos-stack/MemOS/deploy/server
 cp .server.env.example .server.env
-nano .server.env
-```
-
-需要修改四项：
-
-- `ACME_EMAIL`：你的邮箱。
-- `NEO4J_PASSWORD`：新生成的长随机密码。
-- `MEMOS_ACCESS_PASSWORD_HASH`：复制 Windows `MemOS_frontend/.env.local` 中同名值。
-- `MEMOS_SESSION_SECRET`：复制 Windows `MemOS_frontend/.env.local` 中同名值。
-
-`PUBLIC_HOST` 保持 `47.99.110.248`。保存后执行：
-
-```bash
 chmod 600 .server.env
 ```
 
-不要把 `.server.env`、MemOS 的 `.env` 或 API Key 上传到公开 Git 仓库。
+编辑 `.server.env`：
 
-## 5. 构建并启动
+```dotenv
+PUBLIC_HOST=memory.example.com
+ACME_EMAIL=admin@example.com
+NEO4J_PASSWORD=使用独立的长随机密码
+MEMOS_FRONTEND_DIST=/opt/memos-stack/MemOS_frontend/dist
+```
+
+`PUBLIC_HOST` 可以填写域名或公开 IP。使用域名时，应先把 DNS 记录指向服务器。
+
+`.env` 和 `.server.env` 都包含敏感配置，不能提交到 Git。
+
+## 4. 启动
 
 ```bash
 cd /opt/memos-stack/MemOS/deploy/server
-sudo docker compose --env-file .server.env up -d --build
+sudo docker compose --env-file .server.env up -d --build --wait
 sudo docker compose --env-file .server.env ps
 ```
 
-首次构建和拉取 Neo4j、Qdrant 镜像可能需要较长时间。查看日志：
-
-```bash
-sudo docker compose --env-file .server.env logs -f --tail=100
-```
-
-服务正常后，在浏览器打开：
+浏览器访问：
 
 ```text
-https://47.99.110.248/login
+https://memory.example.com/login
 ```
 
-手机 App 中的服务器地址同样填写：
+手机应用和其他客户端使用同一个 HTTPS 根地址。应用 API 位于：
 
 ```text
-https://47.99.110.248
+https://memory.example.com/api/v1/
 ```
 
-这里必须是 `https://`。不能改成 HTTP，也不要在手机上关闭证书校验。
-
-## 6. 验证服务
+## 5. 验证
 
 ```bash
-curl -I https://47.99.110.248/login
-sudo docker compose --env-file .server.env ps
-sudo docker compose --env-file .server.env logs --tail=100 caddy frontend companion memos
+curl -I https://memory.example.com/login
+curl https://memory.example.com/api/v1/health
+sudo docker compose --env-file .server.env logs --tail=100 caddy app-backend memos
 ```
 
-如果 HTTPS 证书暂时未签发，先检查阿里云安全组的 80/443、服务器时间和 Caddy 日志：
+如果证书签发失败，检查 DNS、安全组、服务器时间和 Caddy 日志：
 
 ```bash
 sudo timedatectl status
 sudo docker compose --env-file .server.env logs --tail=200 caddy
 ```
 
-不要临时改成 HTTP 传输密码。IP 证书为短期证书，Caddy 会自动续期；如果当前 Caddy 镜像无法签发，最稳妥的替代方案是把一个域名的 A 记录指向 `47.99.110.248`，再把 `PUBLIC_HOST` 改成该域名。
-
-## 7. 日常操作
+## 日常维护
 
 查看状态：
 
 ```bash
-cd /opt/memos-stack/MemOS/deploy/server
 sudo docker compose --env-file .server.env ps
 ```
 
-重启：
+更新后端：
 
 ```bash
-sudo docker compose --env-file .server.env restart
+sudo docker compose --env-file .server.env up -d --build --wait
 ```
 
-更新代码后重新构建：
+更新前端：
 
 ```bash
-sudo docker compose --env-file .server.env up -d --build
+cd /opt/memos-stack/MemOS_frontend
+npm ci
+npm run build
 ```
 
-停止服务但保留所有数据：
+Caddy 会直接读取新的 `dist` 文件，不需要重建后端容器。
+
+停止并保留数据：
 
 ```bash
 sudo docker compose --env-file .server.env down
 ```
 
-不要执行 `down -v`，它会删除 Neo4j、Qdrant、Topic 和上传文件的数据卷。
+不要添加 `-v`，否则会删除 Neo4j、Qdrant、Topic、上传文件和 Caddy 数据卷。

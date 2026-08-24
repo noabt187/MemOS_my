@@ -549,6 +549,44 @@ class MemOSClient:
             raise MemOSClientError("记忆 ID 不能为空。")
         return self._request("GET", f"/product/get_memory/{encoded_id}")
 
+    def get_memory_dashboard(self, *, user_id: str, cube_id: str) -> Any:
+        """Return the raw dashboard payload for the application backend."""
+        return self._request(
+            "POST",
+            "/product/get_memory_dashboard",
+            {
+                "mem_cube_id": cube_id,
+                "user_id": user_id,
+                "include_preference": True,
+                "include_tool_memory": True,
+                "include_skill_memory": True,
+                "page": 1,
+                "page_size": 500,
+            },
+        )
+
+    def get_scheduler_status(self) -> Any:
+        """Return MemOS scheduler status for backend-side dashboard aggregation."""
+        return self._request("GET", "/product/scheduler/allstatus")
+
+    def get_task_queue_status(self, *, user_id: str) -> Any:
+        """Return the task queue status for one application user."""
+        encoded_user_id = urllib.parse.quote(user_id.strip(), safe="")
+        return self._request(
+            "GET", f"/product/scheduler/task_queue_status?user_id={encoded_user_id}"
+        )
+
+    def delete_memory(self, memory_id: str) -> Any:
+        """Delete one memory through the existing MemOS product API."""
+        normalized_id = memory_id.strip()
+        if not normalized_id:
+            raise MemOSClientError("记忆 ID 不能为空。")
+        return self._request(
+            "POST",
+            "/product/delete_memory",
+            {"memory_ids": [normalized_id], "auto_cleanup_working": True},
+        )
+
     def chat(
         self,
         *,

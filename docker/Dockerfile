@@ -24,12 +24,13 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY docker/ ./docker/
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 
 # Set Python import path
-ENV PYTHONPATH=/app/src
+ENV PYTHONPATH=/app/src:/app/scripts
 
 # Expose port
-EXPOSE 8000
+EXPOSE 8000 8011
 
 # Start the docker
 CMD ["uvicorn", "memos.api.server_api:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
