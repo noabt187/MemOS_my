@@ -78,6 +78,27 @@ services:
     networks:
       - memos_network
 
+  frontend:
+    image: memos-frontend:local
+    container_name: memos-frontend
+    build:
+      context: ../frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:3000:80"
+    depends_on:
+      app-backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - memos_network
+
   neo4j:
     image: neo4j:5.26.6
     container_name: neo4j-docker

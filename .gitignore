@@ -200,6 +200,12 @@ venv.bak/
 !apps/**/*.svg
 !apps/**/*.sh
 
+# Integrated MemOS frontend source (build output remains ignored by frontend/.gitignore)
+!frontend/**/*.json
+!frontend/**/*.html
+!frontend/lib/
+!frontend/lib/**
+
 
 # mypy
 .mypy_cache/

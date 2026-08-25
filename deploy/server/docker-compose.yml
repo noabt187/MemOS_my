@@ -78,6 +78,21 @@ services:
     networks:
       - private
 
+  frontend:
+    image: memos-frontend:local
+    build:
+      context: ../../frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+    networks:
+      - private
+
   caddy:
     image: caddy:2.11.4-alpine
     restart: unless-stopped
@@ -93,6 +108,8 @@ services:
       - caddy_config:/config
     depends_on:
       app-backend:
+        condition: service_healthy
+      frontend:
         condition: service_healthy
     networks:
       - private

@@ -2,10 +2,11 @@
 
 这是一个面向个人 AI 助手和 Agent 的长期记忆系统。它把文字、文档、图片和视频转换为可检索的记忆，并根据记忆证据维护用户近期关注的 Topic。
 
-项目由两部分组成：
+前端和后端现在位于同一个仓库：
 
-- **MemOS 后端**：负责记忆解析、存储、检索、对话、Topic、上传和认证。
-- **MemOS Frontend**：独立的静态管理页面，负责展示和操作，不保存模型密钥，也不直接访问数据库。
+- **后端代码**：位于 `src/` 和 `scripts/`，负责记忆解析、存储、检索、对话、Topic、上传和认证。
+- **前端代码**：位于 `frontend/`，负责展示和操作，不保存模型密钥，也不直接访问数据库。
+- **部署配置**：位于 `docker/` 和 `deploy/server/`，可以一条命令启动完整系统。
 
 ## 功能
 
@@ -28,36 +29,29 @@
         ▼ HTTPS
 服务器 Caddy :443
         │
-        ▼
-应用后端 :8011
-  ├─ 登录与会话
-  ├─ 文件上传
-  ├─ Topic 管理
-  └─ 稳定的 /api/v1 接口
+        ├─ 页面请求 /* ─────────► 前端 :80
         │
-        ▼
-MemOS 核心 :8000
-  ├─ 记忆解析与检索
-  ├─ 文本、图片和视频理解
-  └─ 调度与记忆处理
-        │
-        ├─ Neo4j：记忆关系和结构
-        └─ Qdrant：向量检索
+        └─ 接口请求 /api/v1/* ─► 应用后端 :8011
+                                      │
+                                      ▼
+                                 MemOS 核心 :8000
+                                      │
+                              Neo4j + Qdrant
 ```
 
-本地开发时，8000、8011 和数据库端口只监听 `127.0.0.1`。服务器只部署后端，由 Caddy 提供 HTTPS，公网只开放 80 和 443。前端可以位于本机、另一台服务器或任意客户端项目中。
+本地运行时，完整页面位于 `http://127.0.0.1:3000`，其他服务端口只监听 `127.0.0.1`。服务器由 Caddy 提供统一 HTTPS 地址，公网只开放 80 和 443；前端、8011、8000 和数据库端口都只存在于 Docker 私有网络。
 
 ## 环境要求
 
 - Windows 10/11 和 PowerShell
 - Docker Desktop，包含 Docker Compose
-- Node.js 22 或更高版本，用于运行前端
+- Node.js 22 或更高版本，仅在不使用 Docker、单独开发前端时需要
 - `uv`，用于生成登录密码配置和运行 Python 测试
 - 一个兼容 OpenAI API 的文本模型和 Embedding 服务
 - 可选：支持视频输入的视觉模型
 - 可选：阿里云 OSS，用于把本地视频安全地提供给远程视频模型
 
-前端和后端是两个独立仓库，不要求位于同一目录，也不要求部署在同一台机器。
+服务器只需要克隆当前一个仓库，`frontend/` 已包含完整前端源码。
 
 ## 首次配置
 
@@ -117,22 +111,25 @@ OSS_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com
 
 直接导入视频 HTTPS URL 时，不会重复上传本地文件。
 
-## 启动后端
+## 启动完整系统
 
-首次启动或后端代码发生变化时：
+首次启动或代码发生变化时：
 
 ```powershell
-.\start.ps1 -Build
+docker compose -f .\docker\docker-compose.yml up -d --build --wait
+docker compose -f .\docker\docker-compose.yml ps
 ```
 
 日常启动：
 
 ```powershell
-.\start.ps1
+docker compose -f .\docker\docker-compose.yml up -d --wait
+docker compose -f .\docker\docker-compose.yml ps
 ```
 
 脚本会启动并等待以下服务：
 
+- 前端：`http://127.0.0.1:3000`
 - MemOS 核心：`http://127.0.0.1:8000`
 - 应用后端：`http://127.0.0.1:8011`
 - Neo4j
@@ -143,12 +140,13 @@ OSS_ENDPOINT=https://oss-cn-shanghai.aliyuncs.com
 ```powershell
 curl.exe http://127.0.0.1:8000/health
 curl.exe http://127.0.0.1:8011/api/v1/health
+curl.exe -I http://127.0.0.1:3000/login
 ```
 
 查看日志：
 
 ```powershell
-docker compose -f .\docker\docker-compose.yml logs -f --tail=100 memos app-backend
+docker compose -f .\docker\docker-compose.yml logs -f --tail=100 frontend app-backend memos
 ```
 
 停止服务并保留数据：
@@ -159,17 +157,20 @@ docker compose -f .\docker\docker-compose.yml down
 
 不要执行 `docker compose down -v`，该命令会删除数据库卷。
 
-## 启动前端
+启动完成后，浏览器直接打开 [http://127.0.0.1:3000](http://127.0.0.1:3000)。不需要再单独运行前端。
 
-在本地的 `MemOS_frontend` 仓库中执行：
+## 单独开发前端（可选）
+
+只有修改前端页面时，才需要在 `frontend/` 中运行 Vite：
 
 ```powershell
+cd .\frontend
 $env:MEMOS_APP_API_URL="http://127.0.0.1:8011"
 npm ci
 npm run dev
 ```
 
-打开 [http://localhost:3000/login](http://localhost:3000/login)。连接远程服务器时，把 `MEMOS_APP_API_URL` 改成服务器的 HTTPS API 地址。
+打开 [http://127.0.0.1:3000/login](http://127.0.0.1:3000/login)。`MEMOS_APP_API_URL` 只用于 Vite 开发代理；生产浏览器始终使用同源 `/api/v1`，不需要写服务器 IP。
 
 ## 页面功能
 
@@ -222,7 +223,7 @@ MEMOS_CORS_ALLOWED_ORIGINS=https://dashboard.example.com,http://localhost:3000
 
 ## 服务器部署
 
-服务器只部署 Caddy、应用后端、MemOS、Neo4j 和 Qdrant，不需要前端仓库或 Node.js。完整步骤见 [deploy/server/README_ZH.md](deploy/server/README_ZH.md)。
+服务器通过同一套 Compose 部署 Caddy、前端、应用后端、MemOS、Neo4j 和 Qdrant，不需要额外克隆前端仓库，也不需要在宿主机安装 Node.js。完整步骤见 [deploy/server/README_ZH.md](deploy/server/README_ZH.md)。
 
 ## 开发检查
 
@@ -236,6 +237,7 @@ uv run --frozen ruff check scripts tests\scripts
 前端：
 
 ```powershell
+cd frontend
 npm run lint
 npm run build
 ```

@@ -24,6 +24,6 @@
 	}
 
 	handle {
-		respond "Not Found" 404
+		reverse_proxy frontend:80
 	}
 }

@@ -1,39 +1,37 @@
 # 本地 Docker Compose
 
-这套 Compose 用于在本机运行完整的 MemOS 后端：
+这套 Compose 用于在本机运行完整的 MemOS 系统：
 
+- `frontend`：管理页面，地址 `127.0.0.1:3000`
 - `memos`：记忆核心，地址 `127.0.0.1:8000`
 - `app-backend`：应用 API、认证、Topic 和文件上传，地址 `127.0.0.1:8011`
 - `neo4j`：图数据存储
 - `qdrant`：向量数据存储
 
-所有端口只监听本机，不向局域网或公网开放。
+所有端口只监听本机，不向局域网或公网开放。前端通过 Docker 私有网络访问 `app-backend`，浏览器只需要打开 `http://127.0.0.1:3000`。
 
 ## 启动
 
 先在仓库根目录准备 `.env`，然后执行：
 
 ```powershell
-.\start.ps1 -Build
+docker compose -f .\docker\docker-compose.yml up -d --build --wait
+docker compose -f .\docker\docker-compose.yml ps
 ```
 
 日常启动：
 
 ```powershell
-.\start.ps1
-```
-
-也可以直接使用 Compose：
-
-```powershell
 docker compose -f .\docker\docker-compose.yml up -d --wait
+docker compose -f .\docker\docker-compose.yml ps
 ```
 
 ## 状态和日志
 
 ```powershell
 docker compose -f .\docker\docker-compose.yml ps
-docker compose -f .\docker\docker-compose.yml logs -f --tail=100 memos app-backend
+docker compose -f .\docker\docker-compose.yml logs -f --tail=100 frontend app-backend memos
+curl.exe -I http://127.0.0.1:3000/login
 curl.exe http://127.0.0.1:8000/health
 curl.exe http://127.0.0.1:8011/api/v1/health
 ```
