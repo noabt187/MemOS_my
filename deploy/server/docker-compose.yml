@@ -3,6 +3,8 @@ name: memos-server
 x-memos-build: &memos-build
   context: ../..
   dockerfile: deploy/server/Dockerfile.memos
+  args:
+    PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}
 
 services:
   memos:
@@ -81,8 +83,8 @@ services:
       PUBLIC_HOST: ${PUBLIC_HOST:?Set PUBLIC_HOST in .server.env}
       ACME_EMAIL: ${ACME_EMAIL:?Set ACME_EMAIL in .server.env}
     ports:
-      - "80:80"
-      - "443:443"
+      - "${MEMOS_HTTP_PORT:-80}:80"
+      - "${MEMOS_HTTPS_PORT:-443}:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

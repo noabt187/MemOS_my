@@ -1,3 +1,6 @@
+import json
+import subprocess
+
 from pathlib import Path
 
 
@@ -55,8 +58,10 @@ def test_public_server_exposes_only_the_application_api() -> None:
     caddyfile = (REPO_ROOT / "deploy/server/Caddyfile").read_text(encoding="utf-8")
 
     assert "image: caddy:2.11.4-alpine" in compose
-    assert '"80:80"' in compose
-    assert '"443:443"' in compose
+    assert '"${MEMOS_HTTP_PORT:-80}:80"' in compose
+    assert '"${MEMOS_HTTPS_PORT:-443}:443"' in compose
+    assert "PIP_INDEX_URL: ${PIP_INDEX_URL:-https://pypi.org/simple}" in compose
+    assert "default_sni {$PUBLIC_HOST}" in caddyfile
     assert "profile shortlived" in caddyfile
     assert "handle /api/v1/*" in caddyfile
     assert "reverse_proxy app-backend:8011" in caddyfile
@@ -71,3 +76,63 @@ def test_public_server_exposes_only_the_application_api() -> None:
     assert "\n  app-backend:" in compose
     assert "app-backend:\n        condition: service_healthy" in compose
     assert "memos:\n        condition: service_healthy" in compose
+
+
+def test_public_server_compose_renders_machine_specific_ports_and_index(tmp_path: Path) -> None:
+    repo_root = tmp_path / "repo"
+    server_dir = repo_root / "deploy" / "server"
+    server_dir.mkdir(parents=True)
+    compose_path = server_dir / "docker-compose.yml"
+    compose_path.write_text(
+        (REPO_ROOT / "deploy/server/docker-compose.yml").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    (repo_root / ".env").write_text("", encoding="utf-8")
+    env_path = server_dir / ".server.env"
+    env_path.write_text(
+        "\n".join(
+            (
+                "PUBLIC_HOST=127.0.0.1",
+                "ACME_EMAIL=test@example.com",
+                "NEO4J_PASSWORD=test-only-password",
+                "MEMOS_CORS_ALLOWED_ORIGINS=",
+                "MEMOS_HTTP_PORT=18080",
+                "MEMOS_HTTPS_PORT=18443",
+                "PIP_INDEX_URL=https://mirror.example/simple/",
+            )
+        ),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            "docker",
+            "compose",
+            "--env-file",
+            str(env_path),
+            "-f",
+            str(compose_path),
+            "config",
+            "--format",
+            "json",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    rendered = json.loads(completed.stdout)
+
+    caddy_ports = {
+        (str(item["published"]), item["target"])
+        for item in rendered["services"]["caddy"]["ports"]
+    }
+    assert caddy_ports == {("18080", 80), ("18443", 443)}
+    assert (
+        rendered["services"]["memos"]["build"]["args"]["PIP_INDEX_URL"]
+        == "https://mirror.example/simple/"
+    )
+    assert (
+        rendered["services"]["app-backend"]["build"]["args"]["PIP_INDEX_URL"]
+        == "https://mirror.example/simple/"
+    )
+    assert "frontend" not in rendered["services"]

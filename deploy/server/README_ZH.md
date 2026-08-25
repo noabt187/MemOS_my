@@ -96,12 +96,19 @@ PUBLIC_HOST=api.example.com
 ACME_EMAIL=admin@example.com
 NEO4J_PASSWORD=使用独立的长随机密码
 MEMOS_CORS_ALLOWED_ORIGINS=
+MEMOS_HTTP_PORT=80
+MEMOS_HTTPS_PORT=443
+PIP_INDEX_URL=https://pypi.org/simple
 ```
 
 - `PUBLIC_HOST`：API 域名或公网 IP。
 - `ACME_EMAIL`：HTTPS 证书通知邮箱。
 - `NEO4J_PASSWORD`：只用于服务器数据库的长随机密码。
 - `MEMOS_CORS_ALLOWED_ORIGINS`：允许浏览器直接调用 API 的前端来源，多个来源用英文逗号分隔。
+- `MEMOS_HTTP_PORT`、`MEMOS_HTTPS_PORT`：Caddy 发布到宿主机的端口。默认使用 80/443；
+  如果当前机器的 80 端口已被占用，可以只把 `MEMOS_HTTP_PORT` 改成 8080。
+- `PIP_INDEX_URL`：构建后端镜像时使用的 Python 包索引。默认使用 PyPI；网络受限的服务器
+  可以在 `.server.env` 中设置可信镜像，而不需要修改 Dockerfile。
 
 例如允许两个独立前端站点直接调用：
 
