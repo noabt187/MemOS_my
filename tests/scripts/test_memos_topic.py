@@ -771,3 +771,180 @@ def test_migrate_legacy_sqlite_preserves_topics_evidence_and_versions(tmp_path: 
     assert evidence[0].initiative_type == "acting"
     assert evidence[0].event_status == "planned"
     assert evidence[0].event_time == "2026-08-22T09:00:00+08:00"
+
+
+def test_memory_client_lists_text_memories_from_dashboard():
+    response = MagicMock()
+    response.read.return_value = json.dumps(
+        {
+            "code": 200,
+            "data": {
+                "text_mem": [
+                    {
+                        "cube_id": "cube-1",
+                        "memories": [
+                            {
+                                "id": "memory-1",
+                                "memory": "用户制定了复习计划。",
+                                "metadata": {
+                                    "status": "activated",
+                                    "info": {"record_type": "event"},
+                                },
+                            }
+                        ],
+                    }
+                ],
+                "statistics": {"total_text_nodes": 1},
+            },
+        },
+        ensure_ascii=False,
+    ).encode("utf-8")
+    response.__enter__.return_value = response
+    client = memos_topic.MemOSMemoryClient("http://127.0.0.1:8000")
+    client.opener.open = MagicMock(return_value=response)
+
+    memories = client.list_memories(user_id="user-1", cube_id="cube-1")
+
+    assert [item["id"] for item in memories] == ["memory-1"]
+    request = client.opener.open.call_args.args[0]
+    assert request.full_url.endswith("/product/get_memory_dashboard")
+    assert json.loads(request.data) == {
+        "mem_cube_id": "cube-1",
+        "user_id": "user-1",
+        "include_preference": False,
+        "include_tool_memory": False,
+        "include_skill_memory": False,
+        "page": None,
+        "page_size": None,
+    }
+
+
+def test_backfill_selects_only_unprocessed_events_from_requested_batch(tmp_path: Path):
+    def event_memory(memory_id: str, batch_id: str) -> dict:
+        return {
+            "id": memory_id,
+            "memory": f"事件 {memory_id}",
+            "metadata": {
+                "status": "activated",
+                "created_at": "2026-08-24T09:00:00+08:00",
+                "info": {
+                    "record_type": "event",
+                    "ingest_batch_id": batch_id,
+                    "event_status": "ongoing",
+                },
+            },
+        }
+
+    already_processed = event_memory("memory-1", "batch-current")
+    pending = event_memory("memory-2", "batch-current")
+    other_batch = event_memory("memory-3", "batch-other")
+    non_event = event_memory("memory-4", "batch-current")
+    non_event["metadata"]["info"]["record_type"] = "note"
+    all_memories = [already_processed, pending, other_batch, non_event]
+
+    class FakeClient:
+        def __init__(self):
+            self.requested_ids = []
+
+        def list_memories(self, *, user_id, cube_id):
+            assert (user_id, cube_id) == ("user-1", "cube-1")
+            return all_memories
+
+        def get_by_ids(self, memory_ids):
+            self.requested_ids.extend(memory_ids)
+            wanted = set(memory_ids)
+            return [item for item in all_memories if item["id"] in wanted]
+
+    class FakeLLM:
+        def extract_tags(self, memory, catalog):
+            return {"tags": []}
+
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    store.save_memory(user_id="user-1", cube_id="cube-1", memory=already_processed)
+    store.replace_tags(
+        user_id="user-1",
+        cube_id="cube-1",
+        memory_id="memory-1",
+        evidence=[],
+    )
+    client = FakeClient()
+    processor = memos_topic.TopicProcessor(store=store, memos_client=client, llm=FakeLLM())
+
+    result = processor.backfill(
+        user_id="user-1",
+        cube_id="cube-1",
+        ingest_batch_id="batch-current",
+    )
+
+    assert result.selected_memories == 2
+    assert result.pending_memories == 1
+    assert result.processed_memories == 1
+    assert client.requested_ids == ["memory-2"]
+    assert store.tagged_memory_ids("user-1", "cube-1") == {"memory-1", "memory-2"}
+
+
+def test_backfill_rebuilds_missing_topic_after_all_tags_were_saved(tmp_path: Path):
+    memory = {
+        "id": "memory-1",
+        "memory": "用户主动制定了考试复习计划。",
+        "metadata": {
+            "status": "activated",
+            "created_at": "2026-08-24T09:00:00+08:00",
+            "info": {
+                "record_type": "event",
+                "ingest_batch_id": "batch-current",
+                "event_status": "planned",
+            },
+        },
+    }
+    evidence = memos_topic.TagEvidence(
+        memory_id="memory-1",
+        topic_key="final_exam",
+        tag_name="期末考试",
+        relationship="direct",
+        initiative_type="initiated",
+        reason="用户主动制定了考试复习计划。",
+        evidence_unit="memory-1",
+        observed_at="2026-08-24T09:00:00+08:00",
+        event_time=None,
+        event_status="planned",
+    )
+
+    class FakeLLM:
+        def generate_topic(self, *, topic_key, evidence, memories, metrics):
+            return {
+                "topic_text": "用户正在主动准备期末考试。",
+                "reason_summary": "用户已经制定了明确的复习计划。",
+                "reason_evidence": [
+                    {
+                        "memory_id": "memory-1",
+                        "fact": "用户制定了考试复习计划。",
+                        "contribution": "证明用户主动开始准备考试。",
+                    }
+                ],
+            }
+
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    store.save_memory(user_id="user-1", cube_id="cube-1", memory=memory)
+    store.replace_tags(
+        user_id="user-1",
+        cube_id="cube-1",
+        memory_id="memory-1",
+        evidence=[evidence],
+    )
+    client = SimpleNamespace(
+        list_memories=lambda **kwargs: [memory],
+        get_by_ids=lambda memory_ids: [],
+    )
+    processor = memos_topic.TopicProcessor(store=store, memos_client=client, llm=FakeLLM())
+
+    result = processor.backfill(
+        user_id="user-1",
+        cube_id="cube-1",
+        ingest_batch_id="batch-current",
+    )
+
+    assert result.pending_memories == 0
+    assert result.processed_memories == 0
+    topics = store.list_topics(user_id="user-1", cube_id="cube-1")
+    assert [item["topic_key"] for item in topics] == ["final_exam"]

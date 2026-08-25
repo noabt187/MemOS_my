@@ -171,6 +171,13 @@ class TopicDraft:
     reason_evidence: list[ReasonEvidence]
 
 
+@dataclass(frozen=True)
+class BackfillResult:
+    selected_memories: int
+    pending_memories: int
+    processed_memories: int
+
+
 def extract_added_memories(response: Any) -> list[dict[str, Any]]:
     """Return every concrete memory produced by one synchronous MemOS add call."""
     if not isinstance(response, dict) or response.get("code", 200) != 200:
@@ -571,6 +578,14 @@ class TopicStore:
             for memory_id, record in scope["memories"].items()
             if record.get("active", False)
         )
+
+    def tagged_memory_ids(self, user_id: str, cube_id: str) -> set[str]:
+        """Return memories whose Topic tag extraction has completed, including empty results."""
+        state = self._read()
+        scope = self._scope(state, user_id, cube_id)
+        if scope is None:
+            return set()
+        return {str(memory_id) for memory_id in scope["tags"]}
 
     def deactivate_memory(self, memory_id: str) -> list[tuple[str, str, str]]:
         """Stop one deleted/archived MemOS memory from voting and return affected Topics."""
@@ -1082,6 +1097,40 @@ class MemOSMemoryClient:
                 returned_ids.add(memory_id)
         return result
 
+    def list_memories(self, *, user_id: str, cube_id: str) -> list[dict[str, Any]]:
+        """Read all text memories visible to one Topic scope from the dashboard route."""
+        request = urllib.request.Request(
+            f"{self.base_url}/product/get_memory_dashboard",
+            data=json.dumps(
+                {
+                    "mem_cube_id": cube_id,
+                    "user_id": user_id,
+                    "include_preference": False,
+                    "include_tool_memory": False,
+                    "include_skill_memory": False,
+                    "page": None,
+                    "page_size": None,
+                }
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+            method="POST",
+        )
+        try:
+            with self.opener.open(request, timeout=self.timeout) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"读取 MemOS 记忆列表失败：{exc}") from exc
+        if not isinstance(payload, dict) or payload.get("code", 200) != 200:
+            raise RuntimeError("读取 MemOS 记忆列表失败：服务返回了错误响应")
+        groups = (payload.get("data") or {}).get("text_mem", [])
+        return [
+            memory
+            for group in groups
+            if isinstance(group, dict)
+            for memory in group.get("memories", [])
+            if isinstance(memory, dict)
+        ]
+
 
 @dataclass(frozen=True)
 class TopicModelConfig:
@@ -1372,6 +1421,48 @@ class TopicProcessor:
         )
         return len(memories)
 
+    def backfill(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        ingest_batch_id: str | None = None,
+    ) -> BackfillResult:
+        """Select untagged event memories already stored in MemOS and finish Topic updates."""
+        memories = self.memos_client.list_memories(user_id=user_id, cube_id=cube_id)
+        selected_ids = list(
+            dict.fromkeys(
+                memory_id
+                for memory in memories
+                if (
+                    (
+                        memory.get("metadata")
+                        if isinstance(memory.get("metadata"), dict)
+                        else {}
+                    ).get("status", "activated")
+                    == "activated"
+                    and _memory_info(memory).get("record_type") == "event"
+                    and (
+                        ingest_batch_id is None
+                        or _memory_info(memory).get("ingest_batch_id") == ingest_batch_id
+                    )
+                    and (memory_id := _memory_id(memory))
+                )
+            )
+        )
+        tagged_ids = self.store.tagged_memory_ids(user_id, cube_id)
+        pending_ids = [memory_id for memory_id in selected_ids if memory_id not in tagged_ids]
+        processed = self.process_memory_ids(
+            memory_ids=pending_ids,
+            user_id=user_id,
+            cube_id=cube_id,
+        )
+        return BackfillResult(
+            selected_memories=len(selected_ids),
+            pending_memories=len(pending_ids),
+            processed_memories=processed,
+        )
+
     def reconcile(self, batch_size: int = 100) -> int:
         """Remove Topic votes whose source memory is gone or no longer active in MemOS."""
         active_ids = self.store.active_memory_ids()
@@ -1522,7 +1613,8 @@ def _load_project_env() -> None:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MemOS 外部 Topic 处理器")
     parser.add_argument(
-        "command", choices=["run-once", "watch", "reconcile", "list", "migrate-legacy"]
+        "command",
+        choices=["backfill", "run-once", "watch", "reconcile", "list", "migrate-legacy"],
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--state", "--db", dest="state", default=None)
@@ -1534,6 +1626,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--include-suppressed", action="store_true")
     parser.add_argument("--legacy-db", default=None)
     parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument("--ingest-batch-id", default=None)
     return parser.parse_args()
 
 
@@ -1568,6 +1661,14 @@ def main() -> int:
         llm=TopicLLM(TopicModelConfig.from_env()),
         daily_limit=max(1, args.daily_limit),
     )
+    if args.command == "backfill":
+        result = processor.backfill(
+            user_id=args.user,
+            cube_id=args.cube,
+            ingest_batch_id=args.ingest_batch_id,
+        )
+        print(json.dumps(asdict(result), ensure_ascii=False, indent=2))
+        return 0
     if args.command in {"run-once", "reconcile"}:
         print(f"已移除 {processor.reconcile()} 条失效记忆的 Topic 贡献。")
         return 0
