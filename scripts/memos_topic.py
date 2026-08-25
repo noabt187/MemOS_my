@@ -755,7 +755,7 @@ def default_store_path() -> Path:
 def _legacy_json(value: Any, fallback: Any) -> Any:
     if value is None:
         return fallback
-    if isinstance(value, (dict, list)):
+    if isinstance(value, dict | list):
         return value
     try:
         parsed = json.loads(str(value))
@@ -1436,9 +1436,7 @@ class TopicProcessor:
                 for memory in memories
                 if (
                     (
-                        memory.get("metadata")
-                        if isinstance(memory.get("metadata"), dict)
-                        else {}
+                        memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
                     ).get("status", "activated")
                     == "activated"
                     and _memory_info(memory).get("record_type") == "event"

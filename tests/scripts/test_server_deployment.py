@@ -123,8 +123,7 @@ def test_public_server_compose_renders_machine_specific_ports_and_index(tmp_path
     rendered = json.loads(completed.stdout)
 
     caddy_ports = {
-        (str(item["published"]), item["target"])
-        for item in rendered["services"]["caddy"]["ports"]
+        (str(item["published"]), item["target"]) for item in rendered["services"]["caddy"]["ports"]
     }
     assert caddy_ports == {("18080", 80), ("18443", 443)}
     assert (
