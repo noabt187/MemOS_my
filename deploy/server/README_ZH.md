@@ -1,154 +1,193 @@
-# MemOS 服务器部署
+# MemOS 后端服务器部署
 
-本目录用于把 MemOS 部署为一套 HTTPS 服务。部署包含：
+本目录用于部署独立的 MemOS 后端 API。服务器不包含前端代码，也不需要 Node.js。
 
-- Caddy：提供 HTTPS、静态前端和反向代理
-- 应用后端：认证、上传、Topic 和 `/api/v1`
-- MemOS：记忆解析、存储与检索
+部署包含：
+
+- Caddy：提供公网 HTTPS API
+- 应用后端：认证、上传、Topic 和稳定的 `/api/v1` 接口
+- MemOS：记忆解析、存储和检索
 - Neo4j：图数据存储
 - Qdrant：向量数据存储
 
-公网只需要开放 80 和 443。MemOS、应用后端和数据库均位于 Docker 私有网络中。
+```text
+任意前端或客户端
+        │ HTTPS
+        ▼
+      Caddy
+        │
+        ▼
+   应用后端 :8011
+        │
+        ▼
+     MemOS :8000
+        │
+   Neo4j + Qdrant
+```
+
+公网只开放 80 和 443。8000、8011 和数据库端口只存在于 Docker 私有网络中。
 
 ## 服务器要求
 
 - 推荐 Ubuntu 24.04 LTS
 - Docker Engine 和 Docker Compose Plugin
 - 至少 4 核 CPU、16 GB 内存和 50 GB 可用磁盘
-- 一个域名，或支持公开访问的服务器 IP
-- 已构建的 `MemOS_frontend/dist` 静态文件
+- 一个指向服务器的域名，或可公开访问的服务器 IP
 
 安全组建议：
 
 | 端口 | 用途 | 来源 |
 | --- | --- | --- |
 | 22 | SSH | 仅管理员 IP |
-| 80 | HTTP 与证书签发 | 公网 |
-| 443 | HTTPS | 公网 |
+| 80 | HTTP 和证书签发 | 公网 |
+| 443 | HTTPS API | 公网 |
 
 不要开放 8000、8011、6333、6334、7474 或 7687。
 
-## 目录结构
+## 1. 获取后端代码
 
-建议把两个仓库放在同一目录：
-
-```text
-/opt/memos-stack/
-├─ MemOS/
-└─ MemOS_frontend/
-```
-
-## 1. 准备 MemOS 配置
+服务器只需要 MemOS 仓库：
 
 ```bash
-cd /opt/memos-stack/MemOS
-cp docker/.env.example .env
-chmod 600 .env
+sudo mkdir -p /opt/memos
+sudo chown -R "$USER":"$USER" /opt/memos
+cd /opt/memos
+git clone -b lwm_dev https://github.com/noabt187/MemOS_my.git MemOS
+cd MemOS
 ```
 
-编辑 `.env`，填写文本模型、记忆解析模型和 Embedding 配置。需要视频解析时，再填写视频模型和 OSS 配置。
+## 2. 配置 MemOS
 
-生产环境必须启用登录保护。可以在可信的管理电脑上执行：
+```bash
+cp docker/.env.example .env
+chmod 600 .env
+nano .env
+```
+
+至少填写文本模型、记忆解析模型和 Embedding 配置。需要视频解析时，再填写视频模型和 OSS 配置。
+
+生产环境必须设置登录密码。可以在可信的 Windows 管理电脑上执行：
 
 ```powershell
 .\scripts\set_memos_access_password.ps1
 ```
 
-然后通过安全方式把生成的 `.env` 传到服务器。也可以在已安装 `uv` 的服务器上执行：
+然后通过安全方式把生成的 `.env` 传到服务器。服务器安装了 `uv` 时，也可以直接执行：
 
 ```bash
 uv run --frozen python scripts/memos_app_auth.py
 ```
 
-## 2. 构建前端
+`.env` 包含模型密钥和认证配置，不能提交到 Git。
+
+## 3. 配置公网 API
 
 ```bash
-cd /opt/memos-stack/MemOS_frontend
-npm ci
-npm run build
-```
-
-构建结果位于 `MemOS_frontend/dist`。生产环境只需要这些静态文件，不运行 Node 服务。
-
-## 3. 准备部署变量
-
-```bash
-cd /opt/memos-stack/MemOS/deploy/server
+cd /opt/memos/MemOS/deploy/server
 cp .server.env.example .server.env
 chmod 600 .server.env
+nano .server.env
 ```
 
-编辑 `.server.env`：
+填写：
 
 ```dotenv
-PUBLIC_HOST=memory.example.com
+PUBLIC_HOST=api.example.com
 ACME_EMAIL=admin@example.com
 NEO4J_PASSWORD=使用独立的长随机密码
-MEMOS_FRONTEND_DIST=/opt/memos-stack/MemOS_frontend/dist
+MEMOS_CORS_ALLOWED_ORIGINS=
 ```
 
-`PUBLIC_HOST` 可以填写域名或公开 IP。使用域名时，应先把 DNS 记录指向服务器。
+- `PUBLIC_HOST`：API 域名或公网 IP。
+- `ACME_EMAIL`：HTTPS 证书通知邮箱。
+- `NEO4J_PASSWORD`：只用于服务器数据库的长随机密码。
+- `MEMOS_CORS_ALLOWED_ORIGINS`：允许浏览器直接调用 API 的前端来源，多个来源用英文逗号分隔。
 
-`.env` 和 `.server.env` 都包含敏感配置，不能提交到 Git。
+例如允许两个独立前端站点直接调用：
+
+```dotenv
+MEMOS_CORS_ALLOWED_ORIGINS=https://dashboard.example.com,https://admin.example.com
+```
+
+不能填写 `*`。如果本地前端通过 Vite 代理访问后端，可以保持为空。
 
 ## 4. 启动
 
 ```bash
-cd /opt/memos-stack/MemOS/deploy/server
+cd /opt/memos/MemOS/deploy/server
 sudo docker compose --env-file .server.env up -d --build --wait
 sudo docker compose --env-file .server.env ps
 ```
 
-浏览器访问：
+API 根地址：
 
 ```text
-https://memory.example.com/login
+https://api.example.com/api/v1/
 ```
 
-手机应用和其他客户端使用同一个 HTTPS 根地址。应用 API 位于：
-
-```text
-https://memory.example.com/api/v1/
-```
-
-## 5. 验证
+健康检查：
 
 ```bash
-curl -I https://memory.example.com/login
-curl https://memory.example.com/api/v1/health
-sudo docker compose --env-file .server.env logs --tail=100 caddy app-backend memos
+curl https://api.example.com/api/v1/health
 ```
 
-如果证书签发失败，检查 DNS、安全组、服务器时间和 Caddy 日志：
+Caddy 对 `/api/v1/*` 之外的路径返回 404，不提供网页或静态文件。
 
-```bash
-sudo timedatectl status
-sudo docker compose --env-file .server.env logs --tail=200 caddy
+## 5. 客户端认证
+
+同源代理可以使用网页登录接口和 HttpOnly Cookie。独立前端、手机应用和其他 Agent 推荐使用 Bearer Token：
+
+```http
+POST /api/v1/auth/mobile/login
+Content-Type: application/json
+
+{"password":"管理密码"}
 ```
+
+返回的 `session_token` 用于后续请求：
+
+```http
+Authorization: Bearer <session_token>
+```
+
+Token 和管理密码都不能写入前端仓库或公开日志。
+
+## 6. 本地前端连接服务器
+
+前端可以位于任意本地目录，不需要上传到服务器：
+
+```powershell
+cd D:\your-projects\MemOS_frontend
+$env:MEMOS_APP_API_URL="https://api.example.com"
+npm ci
+npm run dev
+```
+
+浏览器访问 `http://localhost:3000`。Vite 把本地 `/api/v1` 请求代理到远程服务器。
 
 ## 日常维护
 
 查看状态：
 
 ```bash
+cd /opt/memos/MemOS/deploy/server
 sudo docker compose --env-file .server.env ps
 ```
 
-更新后端：
+查看日志：
 
 ```bash
+sudo docker compose --env-file .server.env logs -f --tail=100 caddy app-backend memos
+```
+
+更新：
+
+```bash
+cd /opt/memos/MemOS
+git pull
+cd deploy/server
 sudo docker compose --env-file .server.env up -d --build --wait
 ```
-
-更新前端：
-
-```bash
-cd /opt/memos-stack/MemOS_frontend
-npm ci
-npm run build
-```
-
-Caddy 会直接读取新的 `dist` 文件，不需要重建后端容器。
 
 停止并保留数据：
 

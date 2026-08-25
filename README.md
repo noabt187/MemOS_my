@@ -25,6 +25,9 @@
 ```text
 浏览器或手机应用
         │
+        ▼ HTTPS
+服务器 Caddy :443
+        │
         ▼
 应用后端 :8011
   ├─ 登录与会话
@@ -42,7 +45,7 @@ MemOS 核心 :8000
         └─ Qdrant：向量检索
 ```
 
-本地开发时，8000、8011 和数据库端口只监听 `127.0.0.1`。服务器部署时由 Caddy 提供 HTTPS，公网只开放 80 和 443。
+本地开发时，8000、8011 和数据库端口只监听 `127.0.0.1`。服务器只部署后端，由 Caddy 提供 HTTPS，公网只开放 80 和 443。前端可以位于本机、另一台服务器或任意客户端项目中。
 
 ## 环境要求
 
@@ -54,13 +57,7 @@ MemOS 核心 :8000
 - 可选：支持视频输入的视觉模型
 - 可选：阿里云 OSS，用于把本地视频安全地提供给远程视频模型
 
-建议把两个仓库放在同一目录：
-
-```text
-workspace/
-├─ MemOS/
-└─ MemOS_frontend/
-```
+前端和后端是两个独立仓库，不要求位于同一目录，也不要求部署在同一台机器。
 
 ## 首次配置
 
@@ -164,14 +161,15 @@ docker compose -f .\docker\docker-compose.yml down
 
 ## 启动前端
 
-在相邻的 `MemOS_frontend` 仓库中执行：
+在本地的 `MemOS_frontend` 仓库中执行：
 
 ```powershell
+$env:MEMOS_APP_API_URL="http://127.0.0.1:8011"
 npm ci
 npm run dev
 ```
 
-打开 [http://localhost:3000/login](http://localhost:3000/login)。开发服务器会把 `/api/v1` 请求转发到 `http://127.0.0.1:8011`。
+打开 [http://localhost:3000/login](http://localhost:3000/login)。连接远程服务器时，把 `MEMOS_APP_API_URL` 改成服务器的 HTTPS API 地址。
 
 ## 页面功能
 
@@ -202,6 +200,14 @@ npm run dev
 | `GET` | `/api/v1/topics` | 获取 Topic |
 | `POST` | `/api/v1/topics/reconcile` | 校验 Topic 证据 |
 
+浏览器直接跨域调用时，需要在服务器配置允许的精确来源：
+
+```dotenv
+MEMOS_CORS_ALLOWED_ORIGINS=https://dashboard.example.com,http://localhost:3000
+```
+
+不能使用 `*`。独立客户端通过 `POST /api/v1/auth/mobile/login` 获取 Bearer Token，并在后续请求中发送 `Authorization: Bearer <token>`。本仓库提供的本地前端默认使用 Vite 代理，因此不需要浏览器直接跨域。
+
 ## 数据位置
 
 | 数据 | 本地位置 |
@@ -216,7 +222,7 @@ npm run dev
 
 ## 服务器部署
 
-生产环境使用静态前端、应用后端、MemOS、Neo4j、Qdrant 和 Caddy。完整步骤见 [deploy/server/README_ZH.md](deploy/server/README_ZH.md)。
+服务器只部署 Caddy、应用后端、MemOS、Neo4j 和 Qdrant，不需要前端仓库或 Node.js。完整步骤见 [deploy/server/README_ZH.md](deploy/server/README_ZH.md)。
 
 ## 开发检查
 

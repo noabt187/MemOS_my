@@ -50,7 +50,7 @@ def test_local_compose_starts_core_and_application_backend_together() -> None:
     assert "/api/v1/health" in compose
 
 
-def test_public_caddy_uses_ip_certificate_capable_release() -> None:
+def test_public_server_exposes_only_the_application_api() -> None:
     compose = (REPO_ROOT / "deploy/server/docker-compose.yml").read_text(encoding="utf-8")
     caddyfile = (REPO_ROOT / "deploy/server/Caddyfile").read_text(encoding="utf-8")
 
@@ -58,10 +58,14 @@ def test_public_caddy_uses_ip_certificate_capable_release() -> None:
     assert '"80:80"' in compose
     assert '"443:443"' in compose
     assert "profile shortlived" in caddyfile
+    assert "handle /api/v1/*" in caddyfile
     assert "reverse_proxy app-backend:8011" in caddyfile
-    assert "root * /srv/frontend" in caddyfile
-    assert "try_files {path} /index.html" in caddyfile
-    assert "MEMOS_FRONTEND_DIST" in compose
+    assert 'respond "Not Found" 404' in caddyfile
+    assert "root * /srv/frontend" not in caddyfile
+    assert "try_files" not in caddyfile
+    assert "MEMOS_FRONTEND_DIST" not in compose
+    assert "/srv/frontend" not in compose
+    assert "MEMOS_CORS_ALLOWED_ORIGINS" in compose
     assert "\n  frontend:" not in compose
     assert "\n  companion:" not in compose
     assert "\n  app-backend:" in compose

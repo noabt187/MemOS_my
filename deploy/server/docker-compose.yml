@@ -57,6 +57,7 @@ services:
       MEMOS_WEB_UPLOAD_DIR: /data/uploads
       MEMOS_AUTH_REQUIRED: "true"
       MEMOS_AUTH_COOKIE_SECURE: "true"
+      MEMOS_CORS_ALLOWED_ORIGINS: ${MEMOS_CORS_ALLOWED_ORIGINS:-}
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .server.env}
     volumes:
       - topic_data:/data/topic
@@ -84,7 +85,6 @@ services:
       - "443:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
-      - ${MEMOS_FRONTEND_DIST:?Set MEMOS_FRONTEND_DIST in .server.env}:/srv/frontend:ro
       - caddy_data:/data
       - caddy_config:/config
     depends_on:

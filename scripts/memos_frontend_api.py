@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Thin local HTTP bridge for the MemOS dashboard.
+"""Public application API for MemOS clients.
 
-The bridge deliberately owns no memory or Topic business logic. It exposes the
-existing runtime importer and the rolling Topic JSON snapshot to the local web
-frontend.
+The service owns authentication, uploads, Topic coordination, and stable API
+responses while delegating memory operations to the private MemOS core.
 """
 
 from __future__ import annotations
@@ -19,6 +18,7 @@ from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Any
+from urllib.parse import urlsplit
 
 import uvicorn
 
@@ -57,6 +57,10 @@ StoreFactory = Callable[[], TopicStore]
 ClientFactory = Callable[[str], MemOSClient]
 Importer = Callable[..., tuple[Any, Any]]
 Reconciler = Callable[..., int]
+DEFAULT_CORS_ALLOWED_ORIGINS = (
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+)
 
 
 class RuntimeContext(BaseModel):
@@ -141,6 +145,32 @@ def _topic_daily_limit() -> int:
         return min(100, max(1, int(raw)))
     except ValueError:
         return 15
+
+
+def _cors_allowed_origins() -> list[str]:
+    raw = os.getenv("MEMOS_CORS_ALLOWED_ORIGINS", "").strip()
+    candidates = raw.split(",") if raw else list(DEFAULT_CORS_ALLOWED_ORIGINS)
+    origins: list[str] = []
+    for candidate in candidates:
+        origin = candidate.strip().rstrip("/")
+        if not origin:
+            continue
+        parsed = urlsplit(origin)
+        if (
+            origin == "*"
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "MEMOS_CORS_ALLOWED_ORIGINS must contain exact HTTP(S) origins "
+                "without paths or wildcards."
+            )
+        if origin not in origins:
+            origins.append(origin)
+    return origins
 
 
 def _safe_filename(filename: str | None) -> str:
@@ -394,10 +424,7 @@ def create_app(
     app = FastAPI(title="MemOS Application API", version="2.0.0")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[
-            "http://localhost:3000",
-            "http://127.0.0.1:3000",
-        ],
+        allow_origins=_cors_allowed_origins(),
         allow_credentials=True,
         allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
         allow_headers=["*"],

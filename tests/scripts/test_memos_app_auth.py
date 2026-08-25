@@ -141,3 +141,44 @@ def test_mobile_login_returns_bearer_token(monkeypatch, tmp_path: Path):
         headers={"Authorization": f"Bearer {body['session_token']}"},
     )
     assert response.status_code == 200
+
+
+def test_cors_allows_only_configured_frontend_origins(monkeypatch, tmp_path: Path):
+    api = _load_script("memos_frontend_api")
+    monkeypatch.setenv(
+        "MEMOS_CORS_ALLOWED_ORIGINS",
+        "https://dashboard.example.com, http://localhost:4173",
+    )
+
+    class FakeStore:
+        path = tmp_path / "topics.json"
+
+        def list_all_topics(self, **kwargs):
+            return []
+
+    app = api.create_app(
+        store_factory=FakeStore,
+        client_factory=lambda base_url: None,
+        upload_dir=tmp_path / "uploads",
+        auth_required=False,
+    )
+    client = TestClient(app)
+
+    allowed = client.options(
+        "/api/v1/topics",
+        headers={
+            "Origin": "https://dashboard.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    denied = client.options(
+        "/api/v1/topics",
+        headers={
+            "Origin": "https://untrusted.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert allowed.status_code == 200
+    assert allowed.headers["access-control-allow-origin"] == "https://dashboard.example.com"
+    assert "access-control-allow-origin" not in denied.headers

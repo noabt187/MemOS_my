@@ -23,8 +23,6 @@
 	}
 
 	handle {
-		root * /srv/frontend
-		try_files {path} /index.html
-		file_server
+		respond "Not Found" 404
 	}
 }
