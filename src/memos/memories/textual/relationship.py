@@ -163,6 +163,43 @@ def _parse_json_object(raw: str | None) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def _parse_complete_event_prefix(raw: str | None) -> list[dict[str, Any]]:
+    """Recover only complete leading event objects from an incomplete response."""
+    if not raw:
+        return []
+    text = raw.strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE)
+
+    match = re.match(r'^\s*\{\s*"events"\s*:\s*\[', text)
+    if match is None:
+        return []
+
+    decoder = json.JSONDecoder()
+    cursor = match.end()
+    events: list[dict[str, Any]] = []
+    while True:
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+        if cursor >= len(text) or text[cursor] == "]":
+            return events
+        if events:
+            if text[cursor] != ",":
+                return events
+            cursor += 1
+            while cursor < len(text) and text[cursor].isspace():
+                cursor += 1
+            if cursor >= len(text):
+                return events
+        try:
+            value, cursor = decoder.raw_decode(text, cursor)
+        except json.JSONDecodeError:
+            return events
+        if not isinstance(value, dict):
+            return events
+        events.append(value)
+
+
 def _is_inline_media_data(value: Any) -> bool:
     if not isinstance(value, str):
         return False
@@ -543,17 +580,36 @@ class PersonalMemoryNormalizer:
 
         parsed = _parse_json_object(response)
         if not parsed:
-            logger.warning("Personal memory normalizer returned invalid JSON")
-            return PersonalMemoryNormalizationResult(
-                events=[],
-                contact_updates=[],
-                discarded=[
-                    {
-                        "source_indices": list(range(len(memories))),
-                        "reason": "invalid_normalizer_output",
-                    }
-                ],
+            raw_events = _parse_complete_event_prefix(response)
+            events: list[TextualMemoryItem] = []
+            recovered_indices: set[int] = set()
+            for raw_event in raw_events:
+                event = self._build_event(raw_event, memories, user_id)
+                if event is None:
+                    continue
+                events.append(event)
+                recovered_indices.update(raw_event["source_indices"])
+
+            failed_indices = [
+                index for index in range(len(memories)) if index not in recovered_indices
+            ]
+            logger.warning(
+                "Personal memory normalizer returned incomplete JSON; "
+                "recovered %s complete events and left %s candidates incomplete",
+                len(events),
+                len(failed_indices),
             )
+            discarded = (
+                [
+                    {
+                        "source_indices": failed_indices,
+                        "reason": "incomplete_normalizer_output",
+                    }
+                ]
+                if failed_indices
+                else []
+            )
+            return PersonalMemoryNormalizationResult(events, [], discarded)
 
         raw_events = parsed.get("events", [])
         if not isinstance(raw_events, list):

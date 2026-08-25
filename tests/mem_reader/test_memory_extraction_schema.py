@@ -35,6 +35,15 @@ def test_general_string_prompt_preserves_explicit_timeline_segments():
     assert "EVT-xxx" not in prompt
 
 
+def test_personal_memory_normalizer_preserves_explicit_timeline_segments():
+    prompt = memory_info_prompts.PERSONAL_MEMORY_NORMALIZE_PROMPT_ZH
+
+    assert "按时间顺序记录用户活动的时间流" in prompt
+    assert "每个具有明确开始时间、结束时间、时间范围或独立时间点的活动记录" in prompt
+    assert "不得因为使用同一应用、涉及同一主题或属于同一行为类型而跨时间段合并" in prompt
+    assert "只有属于同一时间段" in prompt
+
+
 def test_validate_memory_extraction_result_accepts_canonical_schema():
     result = utils.validate_memory_extraction_result(
         {

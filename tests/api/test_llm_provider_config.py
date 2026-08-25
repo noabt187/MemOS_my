@@ -215,3 +215,11 @@ def test_memreader_backup_uses_provider_env_for_general_model(monkeypatch):
     assert config["config"]["backup_model_name_or_path"] == "gpt-4.1-mini"
     assert config["config"]["backup_api_key"] == "openai-key"
     assert config["config"]["backup_api_base"] == "https://openai.example/v1"
+
+
+def test_memreader_default_output_limit_supports_large_memory_imports(monkeypatch):
+    monkeypatch.delenv("MEMRADER_MAX_TOKENS", raising=False)
+
+    config = APIConfig.get_memreader_config()
+
+    assert config["config"]["max_tokens"] == 16000

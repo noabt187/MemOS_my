@@ -20,6 +20,15 @@ class FakeLLM:
         return json.dumps(self.responses.pop(0), ensure_ascii=False)
 
 
+class RawFakeLLM:
+    def __init__(self, response: str):
+        self.response = response
+
+    def generate(self, messages: list[dict]) -> str:
+        assert messages[0]["role"] == "user"
+        return self.response
+
+
 class FakeEmbedder:
     def embed(self, texts: list[str]) -> list[list[float]]:
         return [[float(len(text))] for text in texts]
@@ -177,6 +186,38 @@ def test_personal_memory_normalizer_merges_dependent_fragments_into_one_event() 
     assert participant_keys[1].startswith("person_")
     assert "event_purpose" not in result.events[0].metadata.info
     assert result.contact_updates == []
+
+
+def test_personal_memory_normalizer_keeps_complete_events_before_truncated_tail() -> None:
+    response = """{
+      "events": [
+        {
+          "source_indices": [0],
+          "key": "事件一",
+          "memory": "完整事件一",
+          "info": {"record_type": "event"}
+        },
+        {
+          "source_indices": [1],
+          "key": "事件二",
+          "memory": "完整事件二",
+          "info": {"record_type": "event"}
+        },
+        {
+          "source_indices": [2],
+          "key": "事件三",
+          "memory": "被截断的事件
+    """
+    candidates = [make_memory(f"候选事件{i}") for i in range(3)]
+
+    result = PersonalMemoryNormalizer(RawFakeLLM(response), FakeEmbedder()).normalize(
+        candidates,
+        user_id="user-1",
+    )
+
+    assert [event.memory for event in result.events] == ["完整事件一", "完整事件二"]
+    assert result.contact_updates == []
+    assert result.discarded == [{"source_indices": [2], "reason": "incomplete_normalizer_output"}]
 
 
 def test_personal_memory_normalizer_converts_preference_to_ongoing_event() -> None:
