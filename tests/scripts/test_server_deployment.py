@@ -95,6 +95,8 @@ def test_public_server_compose_renders_machine_specific_ports_and_index(tmp_path
                 "PUBLIC_HOST=127.0.0.1",
                 "ACME_EMAIL=test@example.com",
                 "NEO4J_PASSWORD=test-only-password",
+                "MEMOS_ACCESS_PASSWORD_HASH=test-only-hash",
+                "MEMOS_SESSION_SECRET=test-only-session-secret-over-32-characters",
                 "MEMOS_CORS_ALLOWED_ORIGINS=",
                 "MEMOS_HTTP_PORT=18080",
                 "MEMOS_HTTPS_PORT=18443",
@@ -134,4 +136,7 @@ def test_public_server_compose_renders_machine_specific_ports_and_index(tmp_path
         rendered["services"]["app-backend"]["build"]["args"]["PIP_INDEX_URL"]
         == "https://mirror.example/simple/"
     )
+    app_environment = rendered["services"]["app-backend"]["environment"]
+    assert app_environment["MEMOS_ACCESS_PASSWORD_HASH"] == "test-only-hash"
+    assert app_environment["MEMOS_SESSION_SECRET"] == "test-only-session-secret-over-32-characters"
     assert "frontend" not in rendered["services"]

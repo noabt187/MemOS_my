@@ -95,6 +95,8 @@ nano .server.env
 PUBLIC_HOST=api.example.com
 ACME_EMAIL=admin@example.com
 NEO4J_PASSWORD=使用独立的长随机密码
+MEMOS_ACCESS_PASSWORD_HASH=密码工具生成的哈希
+MEMOS_SESSION_SECRET=密码工具生成的至少32位随机密钥
 MEMOS_CORS_ALLOWED_ORIGINS=
 MEMOS_HTTP_PORT=80
 MEMOS_HTTPS_PORT=443
@@ -104,6 +106,8 @@ PIP_INDEX_URL=https://pypi.org/simple
 - `PUBLIC_HOST`：API 域名或公网 IP。
 - `ACME_EMAIL`：HTTPS 证书通知邮箱。
 - `NEO4J_PASSWORD`：只用于服务器数据库的长随机密码。
+- `MEMOS_ACCESS_PASSWORD_HASH`、`MEMOS_SESSION_SECRET`：由密码工具生成；把对应值安全地复制到
+  `.server.env`，Compose 会将它们显式传入应用后端。
 - `MEMOS_CORS_ALLOWED_ORIGINS`：允许浏览器直接调用 API 的前端来源，多个来源用英文逗号分隔。
 - `MEMOS_HTTP_PORT`、`MEMOS_HTTPS_PORT`：Caddy 发布到宿主机的端口。默认使用 80/443；
   如果当前机器的 80 端口已被占用，可以只把 `MEMOS_HTTP_PORT` 改成 8080。
