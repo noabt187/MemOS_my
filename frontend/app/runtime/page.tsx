@@ -107,7 +107,7 @@ export default function RuntimePage() {
 
   return (
     <main className="shell page-shell">
-      <AppRail active="runtime" serviceHealthy={!error} />
+      <AppRail active="runtime" />
       <section className="workspace inner-page runtime-page">
         <header className="page-header">
           <div>
@@ -139,7 +139,7 @@ export default function RuntimePage() {
           <section className="runtime-workspace panel">
             <div className="runtime-copy">
               <p className="section-kicker">TEXT INGEST</p><h2>直接写入一段文字</h2>
-              <p>后端会使用 fine 模式提取记忆，补充结构化 info，并在成功后自动更新 Topic。</p>
+              <p>应用后端会调用 MemOS 提取并写入记忆，然后把新记忆交给 Topic 流程处理。</p>
             </div>
             <form onSubmit={remember}>
               <textarea value={text} onChange={(event) => setText(event.target.value)} rows={11} placeholder="例如：今天下午三点，我和林誉恒在图书馆讨论了期末项目，决定周五前完成演示稿。" />

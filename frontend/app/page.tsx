@@ -84,8 +84,8 @@ export default function Home() {
     setError("");
     try {
       setDashboard(await appApi.dashboard());
-    } catch {
-      setError("前端无法读取 MemOS 数据");
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : "无法读取记忆总览");
     } finally {
       setLoading(false);
     }
@@ -184,10 +184,13 @@ export default function Home() {
   const currentTopics = dashboard?.topics || [];
   const counts = dashboard?.counts;
   const serviceHealthy = dashboard?.backend_status === "online";
+  const serviceLabel = loading && !dashboard
+    ? "正在检查"
+    : serviceHealthy ? "后端在线" : "后端异常";
 
   return (
     <main className="shell" id="top">
-      <AppRail active="overview" serviceHealthy={serviceHealthy} />
+      <AppRail active="overview" />
 
       <section className="workspace">
         <header className="topbar">
@@ -206,7 +209,7 @@ export default function Home() {
             </button>
             <div className={`connection-pill ${serviceHealthy ? "online" : ""}`}>
               <span />
-              {serviceHealthy ? "后端在线" : "后端离线"}
+              {serviceLabel}
             </div>
             <button className="refresh-button" onClick={() => void load()} disabled={loading}>
               {loading ? "同步中" : "刷新数据"}
@@ -249,7 +252,7 @@ export default function Home() {
           </Link>
         </nav>
 
-        {error && <div className="error-banner">{error}，请检查服务器服务状态。</div>}
+        {error && <div className="error-banner">{error}</div>}
         {deleteNotice && (
           <div className={`delete-notice ${deleteNotice.kind}`} role="status">
             {deleteNotice.text}
@@ -360,8 +363,8 @@ export default function Home() {
                   </div>
                 ) : (
                   <div className="topic-empty">
-                    <b>没有读取到真实 Topic</b>
-                    <span>请启动本地 Topic 连接服务。</span>
+                    <b>当前没有 Topic</b>
+                    <span>记忆经过 Topic 处理并达到入选条件后，会显示在这里。</span>
                   </div>
                 )}
               </div>

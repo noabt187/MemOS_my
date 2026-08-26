@@ -71,13 +71,13 @@ npm run dev
 http://127.0.0.1:3000
 ```
 
-Vite 会把 `/api/v1/*` 代理到 `MEMOS_APP_API_URL`。这个变量只用于本地开发代理，不会写入生产浏览器代码，也不能包含密码或 Token。
+Vite 会把 `/api/v1/*` 代理到 `MEMOS_APP_API_URL`。这个变量只用于本地开发与预览代理，不会写入生产浏览器代码，也不能包含密码或 Token。
 
 ## 检查
 
 ```powershell
 npm run lint
-npm run build
+npm test
 ```
 
 构建产物位于 `dist/`，不提交 Git。生产 Docker 镜像会自动执行 `npm ci` 和 `npm run build`，然后由 Nginx 提供静态页面。
@@ -92,7 +92,7 @@ npm run build
 | `/topics` | Topic 排名、证据和版本 |
 | `/upload` | 文字、图片、Markdown 和视频上传 |
 
-所有请求统一使用 `lib/api-client.ts` 中的 `/api/v1` 客户端。页面组件不要直接写 8000、8011、服务器 IP 或模型密钥。
+所有请求统一使用 `lib/api-client.ts` 中的 `/api/v1` 客户端，并由 `lib/api-contract.ts` 校验后端响应。页面组件不要直接写 8000、8011、服务器 IP 或模型密钥。
 
 ## 隐私
 

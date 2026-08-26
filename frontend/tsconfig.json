@@ -8,6 +8,7 @@
     "esModuleInterop": true,
     "module": "esnext",
     "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
     "jsx": "react-jsx",
@@ -16,6 +17,6 @@
       "@/*": ["./*"]
     }
   },
-  "include": ["app", "lib", "src", "vite.config.ts"],
+  "include": ["app", "lib", "src", "tests", "vite.config.ts"],
   "exclude": ["node_modules"]
 }

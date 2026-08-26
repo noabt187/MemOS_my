@@ -525,6 +525,8 @@ button, input { font: inherit; }
 .score-grid span { display: block; color: var(--muted); font-size: 9px; }
 .score-grid strong { display: block; margin-top: 7px; font: 18px var(--font-geist-mono), monospace; }
 .score-grid i { position: absolute; inset: auto 0 0; height: 3px; background: var(--orange); }
+.score-explanation { margin: -15px 0 27px; padding: 11px 13px; border-radius: 10px; background: #f1f6f3; color: #456353; font-size: 10px; line-height: 1.65; }
+.score-explanation.warning { background: #fff4ed; color: #8b4b32; }
 .evidence-section { display: grid; gap: 10px; }
 .evidence-section > p { margin-bottom: 2px; }
 .evidence-section article { display: grid; gap: 7px; padding: 14px; border: 1px solid var(--line); border-radius: 12px; }
@@ -770,8 +772,10 @@ button, input { font: inherit; }
 .evidence-section button code { color: var(--green); font-size: 9px; overflow-wrap: anywhere; }
 .evidence-section button strong { font-size: 12px; line-height: 1.6; }
 .evidence-section button span { color: var(--muted); font-size: 10px; line-height: 1.6; }
+.evidence-section button .evidence-score-line { width: fit-content; padding: 3px 7px; border-radius: 999px; background: var(--green-soft); color: var(--green); font-size: 9px; font-weight: 700; }
 .evidence-section button i { color: var(--green); font-size: 9px; font-style: normal; }
 .evidence-memory-preview { border-color: #9eb5a8 !important; background: var(--green-soft); }
+.evidence-memory-preview.missing { border-color: #e2b8a5 !important; background: #fff3ed; }
 
 @media (max-width: 900px) {
   .runtime-identity { grid-template-columns: 1fr 1fr; }

@@ -1,126 +1,123 @@
-export type MemorySummary = {
-  id: string;
-  title: string;
-  content: string;
-  memory_type: string;
-  source: "video" | "image" | "mixed" | "text" | "conversation" | "direct";
-  category: "event" | "contact" | "media" | "other";
-  created_at: string | null;
-  updated_at: string | null;
-  tags: string[];
-  score?: number | null;
-};
+import {
+  ApiContractError,
+  formatApiErrorDetail,
+  parseAuthResult,
+  parseChatResult,
+  parseDashboard,
+  parseDeleteMemoryResult,
+  parseHealthResult,
+  parseIngestionResult,
+  parseMemoryList,
+  parseMemoryResponse,
+  parseMobileLoginResult,
+  parseReconcileResult,
+  parseSearchResult,
+  parseSessionResult,
+  parseTopicList,
+} from "./api-contract";
 
-export type MemoryDetail = MemorySummary & {
-  confidence: number | string | null;
-  background: string | null;
-  structured: Record<string, unknown>;
-};
-
-export type TopicEvidence = {
-  memory_id: string;
-  fact: string;
-  contribution: string;
-};
-
-export type TopicVersion = {
-  version: number | null;
-  title: string;
-  reason: string;
-  updated_at: string | null;
-};
-
-export type Topic = {
-  id: string;
-  key: string;
-  title: string;
-  reason: string;
-  status: string;
-  progress: string;
-  score: number;
-  supporting_memory_ids: string[];
-  evidence: TopicEvidence[];
-  candidate_reasons: string[];
-  score_breakdown: Record<string, number>;
-  first_seen_at: string | null;
-  last_evidence_at: string | null;
-  version: number | null;
-  updated_at: string | null;
-  versions: TopicVersion[];
-};
-
-export type Dashboard = {
-  backend_status: "online" | "degraded";
-  service_version: string | null;
-  fetched_at: string;
-  scope: { user_id: string; cube_id: string };
-  counts: {
-    memories: number;
-    preferences: number;
-    skills: number;
-    queue_total: number;
-    queue_running: number;
-    queue_waiting: number;
-    active_topics: number;
-  };
-  topics: Topic[];
-  memories: MemorySummary[];
-};
-
-export type MemoryList = {
-  scope: { user_id: string; cube_id: string };
-  total: number;
-  items: MemorySummary[];
-};
-
-export type TopicList = { total: number; items: Topic[] };
-
-export type TopicUpdate = {
-  processed_memories: number;
-  active_topics: number;
-  error: string | null;
-};
-
-export type IngestionResult = {
-  ok: true;
-  kind?: string;
-  filename?: string;
-  file_size?: number;
-  memories_created: number;
-  topic: TopicUpdate;
-};
-
-export type SearchResult = { results: MemorySummary[]; total: number };
-
-export type DeleteMemoryResult = {
-  ok: true;
-  memory_id: string;
-  topic_sync: "updated" | "pending";
-  removed_topic_memories: number;
-};
+export type {
+  Dashboard,
+  DeleteMemoryResult,
+  HealthResult,
+  IngestionResult,
+  MemoryDetail,
+  MemoryList,
+  MemorySummary,
+  MobileLoginResult,
+  SearchResult,
+  Topic,
+  TopicEvidence,
+  TopicList,
+  TopicScoreBreakdown,
+  TopicScoreBreakdownLegacy,
+  TopicScoreBreakdownPartial,
+  TopicScoreBreakdownV2,
+  TopicUpdate,
+  TopicVersion,
+} from "./api-contract";
 
 const APPLICATION_API = "/api/v1";
 
-async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(`${APPLICATION_API}${path}`, {
-    ...init,
-    cache: "no-store",
-    credentials: "same-origin",
-  });
-  const payload = await response.json().catch(() => ({ detail: "后端返回了无效数据。" }));
-  if (!response.ok) {
-    if (
-      response.status === 401 &&
-      !path.startsWith("/auth/") &&
-      typeof window !== "undefined" &&
-      window.location.pathname !== "/login"
-    ) {
-      const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
-      window.location.replace(`/login?return_to=${encodeURIComponent(returnTo)}`);
-    }
-    throw new Error(payload.detail || "应用后端处理失败。");
+export type ApiErrorKind = "network" | "http" | "invalid-response";
+
+export class ApiError extends Error {
+  readonly kind: ApiErrorKind;
+  readonly status: number | null;
+
+  constructor(kind: ApiErrorKind, message: string, status: number | null = null) {
+    super(message);
+    this.name = "ApiError";
+    this.kind = kind;
+    this.status = status;
   }
-  return payload as T;
+}
+
+type Decoder<T> = (payload: unknown) => T;
+
+function redirectToLogin(path: string, status: number) {
+  if (
+    status !== 401 ||
+    path.startsWith("/auth/") ||
+    typeof window === "undefined" ||
+    window.location.pathname === "/login"
+  ) return;
+
+  const returnTo = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+  window.location.replace(`/login?return_to=${encodeURIComponent(returnTo)}`);
+}
+
+async function request<T>(path: string, decode: Decoder<T>, init?: RequestInit): Promise<T> {
+  let response: Response;
+  try {
+    response = await fetch(`${APPLICATION_API}${path}`, {
+      ...init,
+      cache: "no-store",
+      credentials: "same-origin",
+    });
+  } catch {
+    throw new ApiError(
+      "network",
+      "无法连接应用后端。请确认 8011 服务已启动，并检查 MEMOS_APP_API_URL。",
+    );
+  }
+
+  const rawBody = await response.text();
+  let payload: unknown = null;
+  if (rawBody) {
+    try {
+      payload = JSON.parse(rawBody) as unknown;
+    } catch {
+      if (!response.ok) {
+        throw new ApiError(
+          "http",
+          `应用后端请求失败（HTTP ${response.status}），但没有返回可读的错误信息。`,
+          response.status,
+        );
+      }
+      throw new ApiError(
+        "invalid-response",
+        "应用后端返回的不是 JSON。请确认前端连接的是 8011 应用接口，而不是 8000 MemOS 内部接口。",
+        response.status,
+      );
+    }
+  }
+
+  if (!response.ok) {
+    redirectToLogin(path, response.status);
+    throw new ApiError("http", formatApiErrorDetail(payload, response.status), response.status);
+  }
+
+  try {
+    return decode(payload);
+  } catch (reason) {
+    if (!(reason instanceof ApiContractError)) throw reason;
+    throw new ApiError(
+      "invalid-response",
+      `应用后端返回的数据与当前前端不一致：${reason.message} 请同步前后端版本。`,
+      response.status,
+    );
+  }
 }
 
 function json(body: unknown): RequestInit {
@@ -132,37 +129,41 @@ function json(body: unknown): RequestInit {
 }
 
 export const appApi = {
-  login: (password: string) => request<{ ok: true }>("/auth/login", json({ password })),
-  logout: () => request<{ ok: true }>("/auth/logout", { method: "POST" }),
-  session: () => request<{ authenticated: boolean }>("/auth/session"),
-  dashboard: () => request<Dashboard>("/dashboard"),
-  memories: () => request<MemoryList>("/memories"),
+  login: (password: string) => request("/auth/login", parseAuthResult, json({ password })),
+  mobileLogin: (password: string) =>
+    request("/auth/mobile/login", parseMobileLoginResult, json({ password })),
+  logout: () => request("/auth/logout", parseAuthResult, { method: "POST" }),
+  session: () => request("/auth/session", parseSessionResult),
+  health: () => request("/health", parseHealthResult),
+  dashboard: () => request("/dashboard", parseDashboard),
+  memories: () => request("/memories", parseMemoryList),
   memory: (memoryId: string) =>
-    request<{ memory: MemoryDetail }>(`/memories/${encodeURIComponent(memoryId)}`),
+    request(`/memories/${encodeURIComponent(memoryId)}`, parseMemoryResponse),
   deleteMemory: (memoryId: string) =>
-    request<DeleteMemoryResult>(`/memories/${encodeURIComponent(memoryId)}`, {
+    request(`/memories/${encodeURIComponent(memoryId)}`, parseDeleteMemoryResult, {
       method: "DELETE",
     }),
-  topics: () => request<TopicList>("/topics?include_suppressed=true"),
-  reconcileTopics: () =>
-    request<{ ok: true; removed_memories: number }>("/topics/reconcile", json({})),
+  topics: () => request("/topics?include_suppressed=true", parseTopicList),
+  reconcileTopics: () => request("/topics/reconcile", parseReconcileResult, json({})),
   rememberText: (text: string) =>
-    request<IngestionResult>("/ingestions/text", json({ text })),
+    request("/ingestions/text", parseIngestionResult, json({ text })),
   chat: (query: string, sessionId: string) =>
-    request<{ response: string; session_id: string }>(
+    request(
       "/chat",
+      parseChatResult,
       json({ query, session_id: sessionId }),
     ),
-  search: (query: string) => request<SearchResult>("/search", json({ query })),
+  search: (query: string) => request("/search", parseSearchResult, json({ query })),
   ingestFile: (file: File, instruction: string) => {
     const body = new FormData();
     body.append("file", file);
     body.append("instruction", instruction);
-    return request<IngestionResult>("/ingestions", { method: "POST", body });
+    return request("/ingestions", parseIngestionResult, { method: "POST", body });
   },
   ingestVideo: (url: string, instruction: string) =>
-    request<IngestionResult>(
+    request(
       "/ingestions/video",
+      parseIngestionResult,
       json({ url, instruction: instruction || null }),
     ),
 };

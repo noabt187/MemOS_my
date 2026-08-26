@@ -1,11 +1,13 @@
+import { useEffect, useState } from "react";
 import Link from "@/lib/link";
 import { Database, LayoutDashboard, LogOut, MessageSquareText, Sparkles, Upload } from "lucide-react";
 import { appApi } from "@/lib/api-client";
 
 type AppRailProps = {
   active: "overview" | "runtime" | "topics" | "upload";
-  serviceHealthy?: boolean;
 };
+
+type ServiceState = "checking" | "online" | "degraded" | "offline";
 
 const items = [
   { key: "overview", href: "/", label: "总览", icon: LayoutDashboard },
@@ -15,7 +17,22 @@ const items = [
   { key: "upload", href: "/upload", label: "上传", icon: Upload },
 ] as const;
 
-export default function AppRail({ active, serviceHealthy = true }: AppRailProps) {
+export default function AppRail({ active }: AppRailProps) {
+  const [serviceState, setServiceState] = useState<ServiceState>("checking");
+
+  useEffect(() => {
+    let activeRequest = true;
+    void appApi.health()
+      .then((health) => {
+        if (!activeRequest) return;
+        setServiceState(health.status === "healthy" ? "online" : "degraded");
+      })
+      .catch(() => {
+        if (activeRequest) setServiceState("offline");
+      });
+    return () => { activeRequest = false; };
+  }, []);
+
   const logout = async () => {
     try {
       await appApi.logout();
@@ -49,8 +66,12 @@ export default function AppRail({ active, serviceHealthy = true }: AppRailProps)
         <span>退出</span>
       </button>
       <div className="rail-health">
-        <i className={serviceHealthy ? "online" : ""} />
-        <span>{serviceHealthy ? "服务在线" : "服务异常"}</span>
+        <i className={serviceState === "online" ? "online" : ""} />
+        <span>{
+          serviceState === "checking" ? "正在检查" :
+          serviceState === "online" ? "服务在线" :
+          serviceState === "degraded" ? "依赖异常" : "无法连接"
+        }</span>
       </div>
     </aside>
   );

@@ -69,7 +69,7 @@ export default function UploadPage() {
 
   return (
     <main className="shell page-shell">
-      <AppRail active="upload" serviceHealthy={!error} />
+      <AppRail active="upload" />
       <section className="workspace inner-page upload-page">
         <header className="page-header">
           <div>
@@ -127,7 +127,7 @@ export default function UploadPage() {
             </button>
 
             {error && (
-              <div className="upload-message error"><strong>导入失败</strong><span>{error}</span><code>请检查服务器服务状态，或联系管理员</code></div>
+              <div className="upload-message error"><strong>导入失败</strong><span>{error}</span></div>
             )}
             {result && (
               <div className="upload-message success">
@@ -153,14 +153,14 @@ export default function UploadPage() {
           <aside className="ingest-explainer">
             <p className="section-kicker">ONE ROUTE</p>
             <h2>前端不重新实现解析</h2>
-            <p>上传页只负责接收文件。文件进入本地连接服务后，继续使用你已经写好的 Runtime 分类和导入函数。</p>
+            <p>上传页只负责发送文件。文件进入应用后端后，再由已有 Runtime 完成分类、解析和入库。</p>
             <ol>
               <li><b>01</b><span><strong>保存来源文件</strong>保留可追踪的本地来源。</span></li>
               <li><b>02</b><span><strong>Runtime 自动分类</strong>选择文字、图片、图文或视频路径。</span></li>
               <li><b>03</b><span><strong>MemOS 统一入库</strong>由应用后端沿用现有写入链路。</span></li>
               <li><b>04</b><span><strong>Topic 自动更新</strong>写入成功后，直接刷新外部滚动 Topic。</span></li>
             </ol>
-            <div className="path-note">上传文件保存在 <code>.memos/uploads</code>，视频随后按原有配置上传 OSS。</div>
+            <div className="path-note">源文件保存位置和视频 OSS 上传都由应用后端配置，前端不接触服务器路径或密钥。</div>
           </aside>
         </div>
       </section>

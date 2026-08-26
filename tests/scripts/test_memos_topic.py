@@ -4,6 +4,7 @@ import importlib.util
 import json
 import sqlite3
 import sys
+import urllib.error
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -112,6 +113,25 @@ def test_memory_client_falls_back_to_single_get_when_batch_endpoint_misses_memor
     )
 
 
+def test_memory_client_treats_single_get_404_as_a_missing_memory():
+    batch_response = MagicMock()
+    batch_response.read.return_value = json.dumps({"code": 200, "data": {"memories": []}}).encode(
+        "utf-8"
+    )
+    batch_response.__enter__.return_value = batch_response
+    not_found = urllib.error.HTTPError(
+        "http://127.0.0.1:8000/product/get_memory/memory-missing",
+        404,
+        "Not Found",
+        hdrs=None,
+        fp=None,
+    )
+    client = memos_topic.MemOSMemoryClient("http://127.0.0.1:8000")
+    client.opener.open = MagicMock(side_effect=[batch_response, not_found])
+
+    assert client.get_by_ids(["memory-missing"]) == []
+
+
 def test_candidate_metrics_deduplicate_continuous_evidence_units():
     evidence = [
         memos_topic.TagEvidence(
@@ -163,26 +183,27 @@ def test_candidate_metrics_deduplicate_continuous_evidence_units():
     assert set(metrics.supporting_memory_ids) == {"memory-1", "memory-2", "memory-3"}
 
 
-def test_one_active_user_initiated_memory_can_become_candidate():
-    evidence = [
-        memos_topic.TagEvidence(
-            memory_id="memory-1",
-            topic_key="graduation_defense",
-            tag_name="毕业答辩",
-            relationship="direct",
-            initiative_type="initiated",
-            reason="记忆明确说明明天进行毕业答辩。",
-            evidence_unit="memory-1",
-            observed_at="2026-08-19T10:00:00+08:00",
-            event_time="2026-08-20T10:00:00+08:00",
-            event_status="planned",
-        )
-    ]
+def test_one_active_user_commitment_can_become_candidate():
+    for initiative_type in ("initiated", "committed"):
+        evidence = [
+            memos_topic.TagEvidence(
+                memory_id="memory-1",
+                topic_key="graduation_defense",
+                tag_name="毕业答辩",
+                relationship="direct",
+                initiative_type=initiative_type,
+                reason="记忆明确说明明天进行毕业答辩。",
+                evidence_unit="memory-1",
+                observed_at="2026-08-19T10:00:00+08:00",
+                event_time="2026-08-20T10:00:00+08:00",
+                event_status="planned",
+            )
+        ]
 
-    metrics = memos_topic.compute_candidate_metrics(evidence)
+        metrics = memos_topic.compute_candidate_metrics(evidence)
 
-    assert metrics.evidence_count == 1
-    assert metrics.qualifies is True
+        assert metrics.evidence_count == 1
+        assert metrics.qualifies is True
 
 
 def test_rank_formula_uses_visible_base_and_recency():
@@ -192,6 +213,253 @@ def test_rank_formula_uses_visible_base_and_recency():
     )
 
     assert score == 60.0
+
+
+def _assessment(memory_id: str, score: float) -> object:
+    return memos_topic.MemoryAssessment(
+        memory_id=memory_id,
+        eligible=True,
+        agency="acting",
+        action_requirement="ongoing",
+        impact="meaningful",
+        explicit_priority="none",
+        confidence="high",
+        score=score,
+        score_breakdown={"memory_score": score},
+        reasons={"agency": "测试依据"},
+    )
+
+
+def test_memory_importance_is_calculated_from_discrete_model_judgements():
+    memory = {
+        "id": "memory-interview",
+        "memory": "用户已经确认今天晚上七点参加求职面试。",
+        "metadata": {
+            "status": "activated",
+            "created_at": "2026-08-25T09:00:00+08:00",
+            "info": {
+                "record_type": "event",
+                "event_status": "planned",
+                "event_start_at": "2026-08-25T19:00:00+08:00",
+            },
+        },
+    }
+    raw = {
+        "assessment": {
+            "eligible": True,
+            "agency": "committed",
+            "action_requirement": "must_do",
+            "impact": "meaningful",
+            "explicit_priority": "none",
+            "effort": "none",
+            "confidence": "high",
+            "reasons": {
+                "agency": "用户已经确认参加面试。",
+                "action_requirement": "面试尚未发生，需要用户出席。",
+                "impact": "该事件会影响求职进展。",
+                "explicit_priority": "用户没有额外强调。",
+            },
+        }
+    }
+
+    assessment = memos_topic.parse_memory_assessment(
+        memory,
+        raw,
+        now=datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
+    )
+
+    assert assessment.score == 80.0
+    assert assessment.score_breakdown == {
+        "agency_points": 25.0,
+        "action_points": 25.0,
+        "urgency_points": 20.0,
+        "impact_points": 10.0,
+        "priority_points": 0.0,
+        "effort_points": 0.0,
+        "confidence_factor": 1.0,
+        "memory_score": 80.0,
+    }
+
+
+def test_topic_metrics_recalculate_urgency_as_the_deadline_gets_closer():
+    memory = {
+        "id": "memory-deadline",
+        "memory": "用户计划在8月30日提交材料。",
+        "metadata": {
+            "created_at": "2026-08-25T09:00:00+08:00",
+            "info": {
+                "record_type": "event",
+                "event_status": "planned",
+                "event_end_at": "2026-08-30T10:00:00+08:00",
+            },
+        },
+    }
+    assessment = memos_topic.parse_memory_assessment(
+        memory,
+        {
+            "assessment": {
+                "eligible": True,
+                "agency": "observed",
+                "action_requirement": "none",
+                "impact": "trivial",
+                "explicit_priority": "none",
+                "effort": "none",
+                "confidence": "high",
+                "reasons": {},
+            }
+        },
+        now=datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
+    )
+    assert assessment.score == 12
+
+    metrics = memos_topic.compute_topic_metrics(
+        assessments=[assessment],
+        memories=[memory],
+        now=datetime.fromisoformat("2026-08-29T12:00:00+08:00"),
+        threshold=0,
+    )
+
+    assert metrics.score_breakdown["memory_scores"]["memory-deadline"] == 20
+
+
+def test_old_unfinished_event_does_not_keep_full_urgency_forever():
+    memory = {
+        "id": "memory-old",
+        "memory": "用户原计划在六月提交材料。",
+        "metadata": {
+            "info": {
+                "record_type": "event",
+                "event_status": "planned",
+                "event_end_at": "2026-06-01T10:00:00+08:00",
+            }
+        },
+    }
+
+    assert (
+        memos_topic._memory_urgency_points(
+            memory,
+            datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
+        )
+        == 0
+    )
+
+
+def test_related_memory_scores_use_strongest_plus_half_of_supporting_scores():
+    memories = [
+        {"id": "memory-1", "memory": "用户正在准备同一场面试。"},
+        {"id": "memory-2", "memory": "用户整理了这场面试需要的材料。"},
+    ]
+
+    metrics = memos_topic.compute_topic_metrics(
+        assessments=[_assessment("memory-1", 10), _assessment("memory-2", 6)],
+        memories=memories,
+        now=datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
+        threshold=12,
+    )
+
+    assert metrics.qualifies is True
+    assert metrics.score_breakdown["strongest_memory_score"] == 10
+    assert metrics.score_breakdown["supporting_memory_points"] == 3
+    assert metrics.score_breakdown["base_score"] == 13
+
+
+def test_exact_duplicate_memory_only_contributes_its_highest_score():
+    memories = [
+        {"id": "memory-1", "memory": "用户正在准备同一场面试。"},
+        {"id": "memory-2", "memory": " 用户正在准备同一场面试。 "},
+    ]
+
+    metrics = memos_topic.compute_topic_metrics(
+        assessments=[_assessment("memory-1", 10), _assessment("memory-2", 6)],
+        memories=memories,
+        threshold=12,
+    )
+
+    assert metrics.qualifies is False
+    assert metrics.score_breakdown["base_score"] == 10
+    assert metrics.score_breakdown["duplicate_memory_count"] == 1
+
+
+def test_group_parser_keeps_an_omitted_memory_as_a_safe_singleton():
+    groups = memos_topic.parse_memory_groups(
+        {
+            "groups": [
+                {
+                    "memory_ids": ["memory-1"],
+                    "topic_kind": "event",
+                    "reason": "模型只明确判断了第一条记忆。",
+                }
+            ]
+        },
+        ["memory-1", "memory-2"],
+    )
+
+    assert [item.memory_ids for item in groups] == [["memory-1"], ["memory-2"]]
+    assert groups[1].reason == "模型未明确归组，按单条事件独立保留"
+
+
+def test_group_parser_rejects_unknown_or_repeated_memory_ids():
+    invalid_results = [
+        {
+            "groups": [
+                {
+                    "memory_ids": ["memory-unknown"],
+                    "topic_kind": "event",
+                    "reason": "错误引用。",
+                }
+            ]
+        },
+        {
+            "groups": [
+                {
+                    "memory_ids": ["memory-1", "memory-1"],
+                    "topic_kind": "event",
+                    "reason": "重复引用。",
+                }
+            ]
+        },
+    ]
+
+    for raw in invalid_results:
+        try:
+            memos_topic.parse_memory_groups(raw, ["memory-1"])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid Topic grouping should fail")
+
+
+def test_tag_parser_accepts_current_agency_values_and_legacy_initiative_alias():
+    memory = {
+        "id": "memory-1",
+        "memory": "用户观看了一段技术视频。",
+        "metadata": {
+            "status": "activated",
+            "created_at": "2026-08-26T09:00:00+08:00",
+            "info": {"record_type": "event"},
+        },
+    }
+
+    for agency, tag_value, expected in (
+        ("consumed", "consumed", "consumed"),
+        ("committed", "committed", "committed"),
+        ("acting", None, "acting"),
+        ("committed", "initiated", "initiated"),
+    ):
+        tag = {
+            "topic_key": "technical_video",
+            "tag_name": "技术视频",
+            "relationship": "direct",
+            "reason": "记忆明确记录了用户观看技术视频。",
+        }
+        if tag_value is not None:
+            tag["initiative_type"] = tag_value
+        evidence = memos_topic.parse_tag_evidence(
+            memory,
+            {"assessment": {"agency": agency}, "tags": [tag]},
+        )
+
+        assert evidence[0].initiative_type == expected
 
 
 def test_topic_draft_requires_memory_level_reason_evidence():
@@ -280,6 +548,78 @@ def test_deactivate_memory_removes_its_topic_vote(tmp_path: Path):
     )
 
 
+def test_reconcile_retires_a_legacy_topic_after_its_only_memory_is_deleted(tmp_path: Path):
+    state_path = tmp_path / "topics.json"
+    store = memos_topic.TopicStore(state_path)
+    memory = {
+        "id": "memory-legacy",
+        "memory": "用户曾经准备一场考试。",
+        "metadata": {
+            "status": "activated",
+            "created_at": "2026-08-20T10:00:00+08:00",
+            "info": {"record_type": "event", "event_status": "planned"},
+        },
+    }
+    evidence = memos_topic.TagEvidence(
+        memory_id="memory-legacy",
+        topic_key="final_exam",
+        tag_name="期末考试",
+        relationship="direct",
+        initiative_type="acting",
+        reason="记忆明确提到考试准备。",
+        evidence_unit="memory-legacy",
+        observed_at="2026-08-20T10:00:00+08:00",
+        event_time=None,
+        event_status="planned",
+    )
+    metrics = memos_topic.CandidateMetrics(
+        evidence_count=1,
+        relationship_vote_sum=1,
+        qualifies=True,
+        supporting_memory_ids=["memory-legacy"],
+        latest_evidence_at="2026-08-20T10:00:00+08:00",
+        score_breakdown={"base_score": 70, "recency_factor": 1, "rank_score": 70},
+        candidate_reasons=["旧版 Topic 测试"],
+    )
+    store.save_memory(user_id="user-1", cube_id="cube-1", memory=memory)
+    store.replace_tags(
+        user_id="user-1",
+        cube_id="cube-1",
+        memory_id="memory-legacy",
+        evidence=[evidence],
+    )
+    store.upsert_topic(
+        user_id="user-1",
+        cube_id="cube-1",
+        topic_key="final_exam",
+        draft=memos_topic.TopicDraft(
+            topic_text="用户正在准备一场考试。",
+            reason_summary="旧版 Topic 测试。",
+            reason_evidence=[
+                memos_topic.ReasonEvidence(
+                    memory_id="memory-legacy",
+                    fact="用户曾经准备一场考试。",
+                    contribution="这是该 Topic 的唯一依据。",
+                )
+            ],
+        ),
+        metrics=metrics,
+    )
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    topic = next(iter(state["scopes"].values()))["topics"]["final_exam"]
+    topic.pop("selection_version")
+    state_path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+
+    processor = memos_topic.TopicProcessor(
+        store=store,
+        memos_client=SimpleNamespace(get_by_ids=lambda memory_ids: []),
+        llm=SimpleNamespace(),
+    )
+
+    assert processor.reconcile() == 1
+    assert store.list_topics(user_id="user-1", cube_id="cube-1") == []
+
+
 def test_processor_creates_topic_with_traceable_reason(tmp_path: Path):
     store = memos_topic.TopicStore(tmp_path / "topics.json")
     response = {
@@ -317,8 +657,24 @@ def test_processor_creates_topic_with_traceable_reason(tmp_path: Path):
     ]
 
     class FakeLLM:
-        def extract_tags(self, memory, catalog):
+        def analyze_memory(self, memory, catalog):
             return {
+                "assessment": {
+                    "eligible": True,
+                    "agency": "acting",
+                    "action_requirement": "ongoing",
+                    "impact": "meaningful",
+                    "explicit_priority": "important",
+                    "effort": "some",
+                    "confidence": "high",
+                    "reasons": {
+                        "agency": "用户正在处理考试相关事项。",
+                        "action_requirement": "准备工作仍在继续。",
+                        "impact": "考试会影响学习安排。",
+                        "explicit_priority": "用户制定了明确计划。",
+                        "effort": "用户已经开始查看和规划。",
+                    },
+                },
                 "tags": [
                     {
                         "topic_key": "final_exam",
@@ -326,6 +682,17 @@ def test_processor_creates_topic_with_traceable_reason(tmp_path: Path):
                         "relationship": "direct",
                         "initiative_type": "acting",
                         "reason": "记忆与期末考试直接相关。",
+                    }
+                ],
+            }
+
+        def group_memories(self, *, memories, assessments, tags):
+            return {
+                "groups": [
+                    {
+                        "memory_ids": ["memory-1", "memory-2"],
+                        "topic_kind": "event",
+                        "reason": "两条记忆共同说明同一次期末考试准备。",
                     }
                 ]
             }
@@ -369,6 +736,377 @@ def test_processor_creates_topic_with_traceable_reason(tmp_path: Path):
         "memory-1",
         "memory-2",
     ]
+
+
+def test_processor_splits_same_coarse_tag_into_two_standalone_topics(tmp_path: Path):
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    memories = [
+        {
+            "id": "memory-interview",
+            "memory": "用户今天晚上七点参加面试。",
+            "metadata": {
+                "status": "activated",
+                "created_at": "2026-08-25T09:00:00+08:00",
+                "info": {
+                    "record_type": "event",
+                    "event_status": "planned",
+                    "event_start_at": "2026-08-25T19:00:00+08:00",
+                },
+            },
+        },
+        {
+            "id": "memory-deadline",
+            "memory": "用户明天上午十点前完成数据采集和评测。",
+            "metadata": {
+                "status": "activated",
+                "created_at": "2026-08-25T09:05:00+08:00",
+                "info": {
+                    "record_type": "event",
+                    "event_status": "planned",
+                    "event_end_at": "2026-08-26T10:00:00+08:00",
+                },
+            },
+        },
+    ]
+
+    class FakeLLM:
+        def analyze_memory(self, memory, catalog):
+            return {
+                "assessment": {
+                    "eligible": True,
+                    "agency": "committed",
+                    "action_requirement": "must_do",
+                    "impact": "meaningful",
+                    "explicit_priority": "important",
+                    "effort": "none",
+                    "confidence": "high",
+                    "reasons": {
+                        "agency": "用户明确计划执行。",
+                        "action_requirement": "事件尚未完成。",
+                        "impact": "会影响用户后续安排。",
+                        "explicit_priority": "记忆表达了明确安排。",
+                    },
+                },
+                "tags": [
+                    {
+                        "topic_key": "schedule_management",
+                        "tag_name": "日程管理",
+                        "relationship": "direct",
+                        "initiative_type": "initiated",
+                        "reason": "事件具有明确时间安排。",
+                    }
+                ],
+            }
+
+        def group_memories(self, *, memories, assessments, tags):
+            assert {item["memory_id"] for item in assessments} == {
+                "memory-interview",
+                "memory-deadline",
+            }
+            return {
+                "groups": [
+                    {
+                        "memory_ids": ["memory-interview"],
+                        "topic_kind": "event",
+                        "reason": "这是一次面试事件。",
+                    },
+                    {
+                        "memory_ids": ["memory-deadline"],
+                        "topic_kind": "event",
+                        "reason": "这是另一项任务截止事件。",
+                    },
+                ]
+            }
+
+        def generate_topic(self, *, topic_key, evidence, memories, metrics):
+            memory = memories[0]
+            return {
+                "topic_text": memory["memory"],
+                "reason_summary": "这是一条单独达到晋升门槛的重要事件。",
+                "reason_evidence": [
+                    {
+                        "memory_id": memory["id"],
+                        "fact": memory["memory"],
+                        "contribution": "该记忆本身具有较高关注价值。",
+                    }
+                ],
+            }
+
+    processor = memos_topic.TopicProcessor(
+        store=store,
+        memos_client=SimpleNamespace(get_by_ids=lambda memory_ids: memories),
+        llm=FakeLLM(),
+    )
+
+    assert (
+        processor.process_memory_ids(
+            memory_ids=["memory-interview", "memory-deadline"],
+            user_id="user-1",
+            cube_id="cube-1",
+        )
+        == 2
+    )
+    topics = store.list_topics(user_id="user-1", cube_id="cube-1")
+    assert len(topics) == 2
+    assert {tuple(item["supporting_memory_ids"]) for item in topics} == {
+        ("memory-interview",),
+        ("memory-deadline",),
+    }
+
+
+def test_existing_topic_keeps_its_id_when_a_related_memory_joins(tmp_path: Path):
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    grouping_calls = []
+    memories = {
+        "memory-1": {
+            "id": "memory-1",
+            "memory": "用户开始实现项目甲的解析模块。",
+            "metadata": {
+                "status": "activated",
+                "created_at": "2026-08-25T09:00:00+08:00",
+                "info": {"record_type": "event", "event_status": "ongoing"},
+            },
+        },
+        "memory-2": {
+            "id": "memory-2",
+            "memory": "用户继续为项目甲补充自动化测试。",
+            "metadata": {
+                "status": "activated",
+                "created_at": "2026-08-25T10:00:00+08:00",
+                "info": {"record_type": "event", "event_status": "ongoing"},
+            },
+        },
+    }
+
+    class FakeLLM:
+        def analyze_memory(self, memory, catalog):
+            return {
+                "assessment": {
+                    "eligible": True,
+                    "agency": "committed",
+                    "action_requirement": "must_do",
+                    "impact": "meaningful",
+                    "explicit_priority": "important",
+                    "effort": "substantial",
+                    "confidence": "high",
+                    "reasons": {
+                        "agency": "用户正在主动开发。",
+                        "action_requirement": "项目仍需继续完成。",
+                        "impact": "项目会影响后续工作。",
+                        "explicit_priority": "用户正在持续推进。",
+                        "effort": "记忆明确记录了实际开发动作。",
+                    },
+                },
+                "tags": [
+                    {
+                        "topic_key": "project_alpha",
+                        "tag_name": "项目甲",
+                        "relationship": "direct",
+                        "initiative_type": "acting",
+                        "reason": "记忆明确属于项目甲。",
+                    }
+                ],
+            }
+
+        def group_memories(self, *, memories, assessments, tags):
+            grouping_calls.append([item["id"] for item in memories])
+            return {
+                "groups": [
+                    {
+                        "memory_ids": [item["id"] for item in memories],
+                        "topic_kind": "event",
+                        "reason": "这些记忆是同一个项目的连续进展。",
+                    }
+                ]
+            }
+
+        def generate_topic(self, *, topic_key, evidence, memories, metrics):
+            return {
+                "topic_text": "；".join(item["memory"] for item in memories),
+                "reason_summary": "多条记忆记录了同一项目的连续开发进展。",
+                "reason_evidence": [
+                    {
+                        "memory_id": item["id"],
+                        "fact": item["memory"],
+                        "contribution": "支持项目仍在持续推进。",
+                    }
+                    for item in memories
+                ],
+            }
+
+    client = SimpleNamespace(
+        get_by_ids=lambda memory_ids: [memories[memory_id] for memory_id in memory_ids]
+    )
+    processor = memos_topic.TopicProcessor(store=store, memos_client=client, llm=FakeLLM())
+
+    processor.process_memory_ids(
+        memory_ids=["memory-1"],
+        user_id="user-1",
+        cube_id="cube-1",
+    )
+    first_topic = store.list_topics(user_id="user-1", cube_id="cube-1")[0]
+    processor.process_memory_ids(
+        memory_ids=["memory-2"],
+        user_id="user-1",
+        cube_id="cube-1",
+    )
+    updated_topic = store.list_topics(user_id="user-1", cube_id="cube-1")[0]
+
+    assert updated_topic["topic_id"] == first_topic["topic_id"]
+    assert set(updated_topic["supporting_memory_ids"]) == {"memory-1", "memory-2"}
+    assert updated_topic["selection_version"] == memos_topic.TOPIC_SELECTION_VERSION
+
+    processor.process_memory_ids(memory_ids=[], user_id="user-1", cube_id="cube-1")
+    assert len(grouping_calls) == 1
+
+    store.retire_topic(
+        user_id="user-1",
+        cube_id="cube-1",
+        topic_key=updated_topic["topic_key"],
+    )
+    processor.process_memory_ids(memory_ids=[], user_id="user-1", cube_id="cube-1")
+    reactivated_topic = store.list_topics(user_id="user-1", cube_id="cube-1")[0]
+    assert reactivated_topic["topic_id"] == first_topic["topic_id"]
+
+    memories["memory-2"]["memory"] = "用户已经完成项目甲的自动化测试。"
+    processor.process_memory_ids(
+        memory_ids=["memory-2"],
+        user_id="user-1",
+        cube_id="cube-1",
+    )
+    refreshed_topic = store.list_topics(user_id="user-1", cube_id="cube-1")[0]
+    assert "已经完成项目甲的自动化测试" in refreshed_topic["topic_text"]
+    assert len(grouping_calls) == 2
+
+
+def test_processor_only_analyzes_active_event_memories(tmp_path: Path):
+    active_event = {
+        "id": "event-1",
+        "memory": "用户查看了一项普通活动。",
+        "metadata": {"status": "activated", "info": {"record_type": "event"}},
+    }
+    note = {
+        "id": "note-1",
+        "memory": "这是一条说明文字。",
+        "metadata": {"status": "activated", "info": {"record_type": "note"}},
+    }
+    archived_event = {
+        "id": "event-2",
+        "memory": "这条事件已经归档。",
+        "metadata": {"status": "archived", "info": {"record_type": "event"}},
+    }
+    analyzed_ids = []
+
+    class FakeLLM:
+        def analyze_memory(self, memory, catalog):
+            analyzed_ids.append(memory["id"])
+            return {
+                "assessment": {
+                    "eligible": False,
+                    "agency": "observed",
+                    "action_requirement": "none",
+                    "impact": "trivial",
+                    "explicit_priority": "none",
+                    "effort": "none",
+                    "confidence": "high",
+                    "reasons": {},
+                },
+                "tags": [],
+            }
+
+    all_memories = [active_event, note, archived_event]
+    processor = memos_topic.TopicProcessor(
+        store=memos_topic.TopicStore(tmp_path / "topics.json"),
+        memos_client=SimpleNamespace(get_by_ids=lambda memory_ids: all_memories),
+        llm=FakeLLM(),
+    )
+
+    processed = processor.process_memory_ids(
+        memory_ids=["event-1", "note-1", "event-2"],
+        user_id="user-1",
+        cube_id="cube-1",
+    )
+
+    assert processed == 1
+    assert analyzed_ids == ["event-1"]
+
+
+def test_invalid_model_assessment_is_not_marked_as_processed(tmp_path: Path):
+    memory = {
+        "id": "event-invalid",
+        "memory": "用户记录了一项事件。",
+        "metadata": {"status": "activated", "info": {"record_type": "event"}},
+    }
+
+    class FakeLLM:
+        def analyze_memory(self, memory, catalog):
+            return {"tags": []}
+
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    processor = memos_topic.TopicProcessor(
+        store=store,
+        memos_client=SimpleNamespace(get_by_ids=lambda memory_ids: [memory]),
+        llm=FakeLLM(),
+    )
+
+    try:
+        processor.process_memory_ids(
+            memory_ids=["event-invalid"],
+            user_id="user-1",
+            cube_id="cube-1",
+        )
+    except TypeError:
+        pass
+    else:
+        raise AssertionError("missing assessment should fail and be retried later")
+
+    assert store.assessed_memory_ids("user-1", "cube-1") == set()
+
+
+def test_ineligible_memory_does_not_pollute_the_tag_catalog(tmp_path: Path):
+    memory = {
+        "id": "event-ineligible",
+        "memory": "这是一条导入说明，不是用户事件。",
+        "metadata": {"status": "activated", "info": {"record_type": "event"}},
+    }
+
+    class FakeLLM:
+        def analyze_memory(self, memory, catalog):
+            return {
+                "assessment": {
+                    "eligible": False,
+                    "agency": "observed",
+                    "action_requirement": "none",
+                    "impact": "trivial",
+                    "explicit_priority": "none",
+                    "effort": "none",
+                    "confidence": "high",
+                    "reasons": {},
+                },
+                "tags": [
+                    {
+                        "topic_key": "import_instruction",
+                        "tag_name": "导入说明",
+                        "relationship": "direct",
+                        "initiative_type": "observed",
+                        "reason": "模型错误地给说明文字加了标签。",
+                    }
+                ],
+            }
+
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    processor = memos_topic.TopicProcessor(
+        store=store,
+        memos_client=SimpleNamespace(get_by_ids=lambda memory_ids: [memory]),
+        llm=FakeLLM(),
+    )
+    processor.process_memory_ids(
+        memory_ids=["event-ineligible"],
+        user_id="user-1",
+        cube_id="cube-1",
+    )
+
+    assert store.tag_catalog("user-1", "cube-1") == []
 
 
 def test_list_all_topics_returns_rolling_active_and_suppressed_items(tmp_path: Path):
@@ -430,9 +1168,14 @@ def test_list_all_topics_returns_rolling_active_and_suppressed_items(tmp_path: P
 
 
 def test_prompts_only_ask_model_for_discrete_judgements():
+    assert '"assessment"' in memos_topic.TAG_PROMPT
+    assert '"agency"' in memos_topic.TAG_PROMPT
+    assert '"effort"' in memos_topic.TAG_PROMPT
     assert '"relationship"' in memos_topic.TAG_PROMPT
     assert '"initiative_type"' in memos_topic.TAG_PROMPT
     assert '"relevance"' not in memos_topic.TAG_PROMPT
+    assert "不得输出任何数字分数" in memos_topic.TAG_PROMPT
+    assert "相同标签不代表同一件事" in memos_topic.GROUP_PROMPT
     assert '"importance_score"' not in memos_topic.TOPIC_PROMPT
     assert '"urgency_score"' not in memos_topic.TOPIC_PROMPT
     assert '"execution_score"' not in memos_topic.TOPIC_PROMPT
@@ -856,8 +1599,20 @@ def test_backfill_selects_only_unprocessed_events_from_requested_batch(tmp_path:
             return [item for item in all_memories if item["id"] in wanted]
 
     class FakeLLM:
-        def extract_tags(self, memory, catalog):
-            return {"tags": []}
+        def analyze_memory(self, memory, catalog):
+            return {
+                "assessment": {
+                    "eligible": False,
+                    "agency": "observed",
+                    "action_requirement": "none",
+                    "impact": "trivial",
+                    "explicit_priority": "none",
+                    "effort": "none",
+                    "confidence": "high",
+                    "reasons": {},
+                },
+                "tags": [],
+            }
 
     store = memos_topic.TopicStore(tmp_path / "topics.json")
     store.save_memory(user_id="user-1", cube_id="cube-1", memory=already_processed)
@@ -866,6 +1621,11 @@ def test_backfill_selects_only_unprocessed_events_from_requested_batch(tmp_path:
         cube_id="cube-1",
         memory_id="memory-1",
         evidence=[],
+    )
+    store.replace_assessment(
+        user_id="user-1",
+        cube_id="cube-1",
+        assessment=_assessment("memory-1", 0),
     )
     client = FakeClient()
     processor = memos_topic.TopicProcessor(store=store, memos_client=client, llm=FakeLLM())
@@ -881,6 +1641,63 @@ def test_backfill_selects_only_unprocessed_events_from_requested_batch(tmp_path:
     assert result.processed_memories == 1
     assert client.requested_ids == ["memory-2"]
     assert store.tagged_memory_ids("user-1", "cube-1") == {"memory-1", "memory-2"}
+
+
+def test_backfill_reprocesses_old_state_that_has_tags_but_no_assessment(tmp_path: Path):
+    memory = {
+        "id": "memory-legacy",
+        "memory": "用户记录了一项旧事件。",
+        "metadata": {
+            "status": "activated",
+            "info": {"record_type": "event", "event_status": "completed"},
+        },
+    }
+    requested_ids = []
+
+    class FakeClient:
+        def list_memories(self, *, user_id, cube_id):
+            return [memory]
+
+        def get_by_ids(self, memory_ids):
+            requested_ids.extend(memory_ids)
+            return [memory] if memory_ids else []
+
+    class FakeLLM:
+        def analyze_memory(self, memory, catalog):
+            return {
+                "assessment": {
+                    "eligible": False,
+                    "agency": "observed",
+                    "action_requirement": "none",
+                    "impact": "trivial",
+                    "explicit_priority": "none",
+                    "effort": "none",
+                    "confidence": "high",
+                    "reasons": {},
+                },
+                "tags": [],
+            }
+
+    store = memos_topic.TopicStore(tmp_path / "topics.json")
+    store.save_memory(user_id="user-1", cube_id="cube-1", memory=memory)
+    store.replace_tags(
+        user_id="user-1",
+        cube_id="cube-1",
+        memory_id="memory-legacy",
+        evidence=[],
+    )
+    processor = memos_topic.TopicProcessor(
+        store=store,
+        memos_client=FakeClient(),
+        llm=FakeLLM(),
+    )
+
+    result = processor.backfill(user_id="user-1", cube_id="cube-1")
+
+    assert result.pending_memories == 1
+    assert result.processed_memories == 1
+    assert requested_ids == ["memory-legacy"]
+    assert store.assessed_memory_ids("user-1", "cube-1") == {"memory-legacy"}
 
 
 def test_backfill_rebuilds_missing_topic_after_all_tags_were_saved(tmp_path: Path):
@@ -931,6 +1748,11 @@ def test_backfill_rebuilds_missing_topic_after_all_tags_were_saved(tmp_path: Pat
         cube_id="cube-1",
         memory_id="memory-1",
         evidence=[evidence],
+    )
+    store.replace_assessment(
+        user_id="user-1",
+        cube_id="cube-1",
+        assessment=_assessment("memory-1", 70),
     )
     client = SimpleNamespace(
         list_memories=lambda **kwargs: [memory],
