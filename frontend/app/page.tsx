@@ -1,14 +1,11 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
-import Link from "@/lib/link";
-import AppRail from "./components/AppRail";
-import {
-  appApi,
-  Dashboard,
-  MemoryDetail,
-  MemorySummary,
-} from "@/lib/api-client";
+import { type ReactElement, useCallback, useEffect, useMemo, useState } from "react";
+
+import { appApi } from "@/lib/api-client.ts";
+import type { Dashboard, MemoryDetail, MemorySummary } from "@/lib/api-client.ts";
+import Link from "@/lib/link.tsx";
+import AppRail from "./components/AppRail.tsx";
 
 const MEMORY_FILTERS = [
   ["all", "全部"],
@@ -16,6 +13,24 @@ const MEMORY_FILTERS = [
   ["contact", "联系人"],
   ["media", "媒体"],
 ] as const;
+
+const MEMORY_TYPE_LABELS: Readonly<Record<string, string>> = {
+  LongTermMemory: "长期记忆",
+  UserMemory: "用户记忆",
+  PreferenceMemory: "偏好",
+  SkillMemory: "技能",
+  ToolSchemaMemory: "工具",
+  ToolTrajectoryMemory: "工具轨迹",
+};
+
+const SOURCE_LABELS: Readonly<Record<string, string>> = {
+  video: "视频",
+  image: "图片",
+  mixed: "图文",
+  text: "文字",
+  conversation: "对话",
+  direct: "直接写入",
+};
 
 function toText(value: unknown): string[] {
   if (typeof value === "string" && value.trim()) return [value.trim()];
@@ -26,7 +41,7 @@ function toText(value: unknown): string[] {
   return [];
 }
 
-function formatTime(value?: string, includeYear = false) {
+function formatTime(value?: string, includeYear = false): string {
   if (!value) return "时间未知";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
@@ -41,31 +56,25 @@ function formatTime(value?: string, includeYear = false) {
   }).format(date);
 }
 
-function memoryTypeLabel(type?: string) {
-  const labels: Record<string, string> = {
-    LongTermMemory: "长期记忆",
-    UserMemory: "用户记忆",
-    PreferenceMemory: "偏好",
-    SkillMemory: "技能",
-    ToolSchemaMemory: "工具",
-    ToolTrajectoryMemory: "工具轨迹",
-  };
-  return labels[type || ""] || type || "未分类";
+function memoryTypeLabel(type?: string): string {
+  return MEMORY_TYPE_LABELS[type || ""] || type || "未分类";
 }
 
-function sourceLabel(source?: string) {
-  const labels: Record<string, string> = {
-    video: "视频",
-    image: "图片",
-    mixed: "图文",
-    text: "文字",
-    conversation: "对话",
-    direct: "直接写入",
-  };
-  return labels[source || ""] || "直接写入";
+function sourceLabel(source?: string): string {
+  return SOURCE_LABELS[source || ""] || "直接写入";
 }
 
-export default function Home() {
+function getServiceLabel(
+  loading: boolean,
+  dashboard: Dashboard | null,
+  serviceHealthy: boolean,
+): string {
+  if (loading && !dashboard) return "正在检查";
+  if (serviceHealthy) return "后端在线";
+  return "后端异常";
+}
+
+export default function Home(): ReactElement {
   const [dashboard, setDashboard] = useState<Dashboard | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -103,11 +112,11 @@ export default function Home() {
   }, [autoRefresh, load]);
 
   useEffect(() => {
-    const closeOnEscape = (event: KeyboardEvent) => {
+    function closeOnEscape(event: KeyboardEvent): void {
       if (event.key !== "Escape" || deleting) return;
       if (deleteTarget) setDeleteTarget(null);
       else setSelectedMemory(null);
-    };
+    }
     window.addEventListener("keydown", closeOnEscape);
     return () => window.removeEventListener("keydown", closeOnEscape);
   }, [deleteTarget, deleting]);
@@ -124,7 +133,7 @@ export default function Home() {
     [dashboard, deletedMemoryIds],
   );
 
-  const openMemory = async (memory: MemorySummary) => {
+  async function openMemory(memory: MemorySummary): Promise<void> {
     setError("");
     try {
       const result = await appApi.memory(memory.id);
@@ -132,14 +141,14 @@ export default function Home() {
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "无法读取记忆详情");
     }
-  };
+  }
 
-  const askToDelete = (memory: MemorySummary) => {
+  function askToDelete(memory: MemorySummary): void {
     setDeleteError("");
     setDeleteTarget(memory);
-  };
+  }
 
-  const confirmDelete = async () => {
+  async function confirmDelete(): Promise<void> {
     if (!deleteTarget || deleting) return;
     setDeleting(true);
     setDeleteError("");
@@ -163,7 +172,7 @@ export default function Home() {
     } finally {
       setDeleting(false);
     }
-  };
+  }
 
   const filteredMemories = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -184,9 +193,7 @@ export default function Home() {
   const currentTopics = dashboard?.topics || [];
   const counts = dashboard?.counts;
   const serviceHealthy = dashboard?.backend_status === "online";
-  const serviceLabel = loading && !dashboard
-    ? "正在检查"
-    : serviceHealthy ? "后端在线" : "后端异常";
+  const serviceLabel = getServiceLabel(loading, dashboard, serviceHealthy);
 
   return (
     <main className="shell" id="top">

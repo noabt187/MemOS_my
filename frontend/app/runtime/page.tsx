@@ -1,7 +1,5 @@
 "use client";
 
-import { FormEvent, useState } from "react";
-import Link from "@/lib/link";
 import {
   Bot,
   CheckCircle2,
@@ -13,13 +11,17 @@ import {
   Send,
   Upload,
 } from "lucide-react";
-import AppRail from "../components/AppRail";
-import { appApi, IngestionResult, SearchResult } from "@/lib/api-client";
+import { type FormEvent, type ReactElement, useState } from "react";
+
+import { appApi } from "@/lib/api-client.ts";
+import type { IngestionResult, SearchResult } from "@/lib/api-client.ts";
+import Link from "@/lib/link.tsx";
+import AppRail from "../components/AppRail.tsx";
 
 type RuntimeMode = "remember" | "chat" | "search";
 type ChatTurn = { role: "user" | "assistant"; text: string };
 
-export default function RuntimePage() {
+export default function RuntimePage(): ReactElement {
   const [mode, setMode] = useState<RuntimeMode>("remember");
   const [text, setText] = useState("");
   const [query, setQuery] = useState("");
@@ -32,7 +34,7 @@ export default function RuntimePage() {
   const [notice, setNotice] = useState("");
   const [error, setError] = useState("");
 
-  const remember = async (event: FormEvent) => {
+  async function remember(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!text.trim() || loading) return;
     setLoading(true);
@@ -49,9 +51,9 @@ export default function RuntimePage() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const chat = async (event: FormEvent) => {
+  async function chat(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     const nextQuery = query.trim();
     if (!nextQuery || loading) return;
@@ -68,9 +70,9 @@ export default function RuntimePage() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const search = async (event: FormEvent) => {
+  async function search(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!query.trim() || loading) return;
     setLoading(true);
@@ -84,9 +86,9 @@ export default function RuntimePage() {
     } finally {
       setLoading(false);
     }
-  };
+  }
 
-  const reconcile = async () => {
+  async function reconcile(): Promise<void> {
     if (reconciling) return;
     setReconciling(true);
     setError("");
@@ -103,7 +105,7 @@ export default function RuntimePage() {
     } finally {
       setReconciling(false);
     }
-  };
+  }
 
   return (
     <main className="shell page-shell">

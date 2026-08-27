@@ -651,6 +651,19 @@ def create_app(
         topics_result = application_topics(include_suppressed=include_suppressed)
         return {"total": len(topics_result), "items": topics_result}
 
+    @app.get("/api/v1/topics/{topic_id}/trace")
+    def application_topic_trace(topic_id: str) -> dict[str, Any]:
+        user_id, cube_id = _application_scope()
+        trace = resolved_store_factory().topic_selection_trace(
+            user_id=user_id,
+            cube_id=cube_id,
+            topic_id=topic_id,
+            seat_limit=_topic_daily_limit(),
+        )
+        if trace is None:
+            raise HTTPException(status_code=404, detail="没有找到这条 Topic。")
+        return trace
+
     @app.post("/api/v1/topics/reconcile")
     def application_topic_reconcile() -> dict[str, Any]:
         try:

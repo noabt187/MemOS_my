@@ -639,6 +639,7 @@ def test_processor_creates_topic_with_traceable_reason(tmp_path: Path):
                 "info": {
                     "record_type": "event",
                     "source_recorded_at": "2026-08-19T10:00:00+08:00",
+                    "event_time": "无法识别的时间",
                 },
             },
         },
@@ -736,6 +737,49 @@ def test_processor_creates_topic_with_traceable_reason(tmp_path: Path):
         "memory-1",
         "memory-2",
     ]
+
+    trace = store.topic_selection_trace(
+        user_id="user-1",
+        cube_id="cube-1",
+        topic_id=topics[0]["topic_id"],
+        seat_limit=15,
+    )
+    assert trace is not None
+    assert trace["available"] is True
+    assert trace["policy"]["topic_threshold"] == 60.0
+    assert trace["policy"]["supporting_weight"] == 0.5
+    assert trace["grouping"] == {
+        "topic_kind": "event",
+        "reason": "两条记忆共同说明同一次期末考试准备。",
+        "candidate_tag_keys": ["final_exam"],
+        "memory_ids": ["memory-1", "memory-2"],
+    }
+    assert trace["decision"]["rank_position"] == 1
+    assert trace["decision"]["seat_status"] == "active"
+
+    first_memory = trace["memories"][0]
+    assert first_memory["memory_id"] == "memory-1"
+    assert first_memory["initial_score"] == 54.0
+    assert first_memory["current_score"] == 54.0
+    assert first_memory["counting_status"] == "counted"
+    dimensions = {item["key"]: item for item in first_memory["dimensions"]}
+    assert dimensions["agency"] == {
+        "key": "agency",
+        "title": "主动程度",
+        "label": "acting",
+        "score_value": 19.0,
+        "score_unit": "points",
+        "max_value": 25.0,
+        "source": "model",
+        "reason": "用户正在处理考试相关事项。",
+    }
+    assert dimensions["urgency"]["label"] == "invalid_event_time"
+    assert dimensions["urgency"]["source"] == "time_rule"
+    assert dimensions["confidence"]["score_value"] == 1.0
+    assert dimensions["confidence"]["score_unit"] == "multiplier"
+    assert first_memory["tags"][0]["topic_key"] == "final_exam"
+    assert "metadata" not in first_memory
+    assert "selection_fingerprint" not in trace
 
 
 def test_processor_splits_same_coarse_tag_into_two_standalone_topics(tmp_path: Path):

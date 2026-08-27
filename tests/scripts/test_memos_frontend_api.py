@@ -443,6 +443,88 @@ def test_v1_dashboard_and_memories_expose_stable_application_models(monkeypatch,
     assert calls.count(("dashboard", "alice", "daily")) == 2
 
 
+def test_v1_topic_trace_exposes_saved_scoring_process(monkeypatch, tmp_path: Path):
+    monkeypatch.setenv("MEMOS_APP_USER_ID", "alice")
+    monkeypatch.setenv("MEMOS_APP_CUBE_ID", "daily")
+    monkeypatch.setenv("MEMOS_TOPIC_DAILY_LIMIT", "7")
+    calls: list[tuple[object, ...]] = []
+
+    class FakeStore:
+        path = tmp_path / "topics.json"
+
+        def topic_selection_trace(self, **kwargs):
+            calls.append(("trace", kwargs))
+            if kwargs["topic_id"] == "missing-topic":
+                return None
+            return {
+                "topic_id": "topic-1",
+                "topic_key": "python",
+                "available": True,
+                "unavailable_reason": None,
+                "selection_version": 2,
+                "policy": {
+                    "topic_threshold": 60.0,
+                    "supporting_weight": 0.5,
+                    "seat_limit": kwargs["seat_limit"],
+                    "memory_formula": "min(100, 维度分合计) × 置信系数",
+                    "topic_formula": "最强单条 + 其他非重复记忆 × 0.5",
+                    "rank_formula": "Topic 基础分 × 新鲜系数",
+                    "rubric": [],
+                },
+                "grouping": {
+                    "topic_kind": "event",
+                    "reason": "同一次学习任务。",
+                    "candidate_tag_keys": ["python"],
+                    "memory_ids": ["memory-1"],
+                },
+                "decision": {
+                    "qualifies": True,
+                    "base_score": 80.0,
+                    "recency_factor": 0.9,
+                    "rank_score": 72.0,
+                    "rank_position": 1,
+                    "seat_status": "active",
+                    "candidate_reasons": ["单条记忆达到门槛"],
+                },
+                "memories": [],
+            }
+
+    app = memos_frontend_api.create_app(
+        store_factory=FakeStore,
+        client_factory=lambda base_url: SimpleNamespace(health=lambda: {"status": "healthy"}),
+        upload_dir=tmp_path / "uploads",
+    )
+    client = TestClient(app)
+
+    response = client.get("/api/v1/topics/topic-1/trace")
+    missing_response = client.get("/api/v1/topics/missing-topic/trace")
+
+    assert response.status_code == 200
+    assert response.json()["decision"]["rank_score"] == 72.0
+    assert response.json()["policy"]["seat_limit"] == 7
+    assert missing_response.status_code == 404
+    assert calls == [
+        (
+            "trace",
+            {
+                "user_id": "alice",
+                "cube_id": "daily",
+                "topic_id": "topic-1",
+                "seat_limit": 7,
+            },
+        ),
+        (
+            "trace",
+            {
+                "user_id": "alice",
+                "cube_id": "daily",
+                "topic_id": "missing-topic",
+                "seat_limit": 7,
+            },
+        ),
+    ]
+
+
 def test_v1_memory_detail_delete_and_search_keep_workflow_in_application_backend(
     monkeypatch, tmp_path: Path
 ):

@@ -20,7 +20,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -316,8 +316,34 @@ PRIORITY_POINTS = {
 EFFORT_POINTS = {"none": 0.0, "some": 3.0, "substantial": 5.0}
 CONFIDENCE_FACTORS = {"low": 0.5, "medium": 0.8, "high": 1.0}
 TOPIC_SCORE_THRESHOLD = 60.0
+TOPIC_SUPPORTING_WEIGHT = 0.5
 TOPIC_SELECTION_VERSION = 2
 TOPIC_SCORE_REFRESH_SECONDS = 15 * 60
+
+_TRACE_DIMENSION_SPECS = (
+    ("agency", "主动程度", "agency_points", AGENCY_POINTS, "model"),
+    ("action_requirement", "行动要求", "action_points", ACTION_POINTS, "model"),
+    ("impact", "影响程度", "impact_points", IMPACT_POINTS, "model"),
+    (
+        "explicit_priority",
+        "明确优先级",
+        "priority_points",
+        PRIORITY_POINTS,
+        "model",
+    ),
+    ("effort", "已投入精力", "effort_points", EFFORT_POINTS, "model_or_duration_rule"),
+)
+_URGENCY_RUBRIC = {
+    "completed_or_cancelled": 0.0,
+    "no_event_time": 0.0,
+    "invalid_event_time": 0.0,
+    "expired_over_24_hours": 0.0,
+    "within_24_hours": 20.0,
+    "within_72_hours": 16.0,
+    "within_7_days": 12.0,
+    "within_30_days": 6.0,
+    "later_than_30_days": 2.0,
+}
 
 _TOPIC_STORE_LOCKS: dict[str, Any] = {}
 _TOPIC_STORE_LOCKS_GUARD = threading.Lock()
@@ -512,6 +538,184 @@ def parse_topic_draft(
         reason_summary=reason_summary,
         reason_evidence=reason_evidence,
     )
+
+
+def _trace_number(mapping: dict[str, Any], key: str) -> float:
+    value = mapping.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"Topic 透明追踪缺少数值字段：{key}")
+    return float(value)
+
+
+def _trace_string(mapping: dict[str, Any], key: str) -> str:
+    value = mapping.get(key)
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Topic 透明追踪缺少文本字段：{key}")
+    return value.strip()
+
+
+def _trace_rubric(
+    key: str,
+    title: str,
+    values: dict[str, float],
+    *,
+    score_unit: str = "points",
+) -> dict[str, Any]:
+    return {
+        "key": key,
+        "title": title,
+        "score_unit": score_unit,
+        "options": [
+            {"label": label, "score_value": float(score_value)}
+            for label, score_value in values.items()
+        ],
+    }
+
+
+def _topic_trace_policy(seat_limit: int) -> dict[str, Any]:
+    return {
+        "topic_threshold": TOPIC_SCORE_THRESHOLD,
+        "supporting_weight": TOPIC_SUPPORTING_WEIGHT,
+        "seat_limit": max(1, seat_limit),
+        "memory_formula": "min(100, 维度分合计) × 置信系数",
+        "topic_formula": (
+            "规范化后正文相同（忽略大小写和多余空白）的记忆只保留最高分；"
+            "最强单条 + 其他非重复记忆 × 0.5"
+        ),
+        "rank_formula": (
+            "Topic 基础分 × 新鲜系数（24 小时内 1.0，72 小时内 0.9，7 天内 0.75，"
+            "30 天内 0.5，更早或没有时间 0.25）"
+        ),
+        "rubric": [
+            _trace_rubric("agency", "主动程度", AGENCY_POINTS),
+            _trace_rubric("action_requirement", "行动要求", ACTION_POINTS),
+            _trace_rubric("urgency", "时间紧迫度", _URGENCY_RUBRIC),
+            _trace_rubric("impact", "影响程度", IMPACT_POINTS),
+            _trace_rubric("explicit_priority", "明确优先级", PRIORITY_POINTS),
+            _trace_rubric(
+                "effort",
+                "已投入精力（模型分与时长规则取较高值：满 5 分钟但不足 20 分钟 1 分，"
+                "满 20 分钟但不足 60 分钟 3 分，满 60 分钟 5 分）",
+                EFFORT_POINTS,
+            ),
+            _trace_rubric(
+                "confidence",
+                "证据置信度",
+                CONFIDENCE_FACTORS,
+                score_unit="multiplier",
+            ),
+        ],
+    }
+
+
+def _urgency_trace_label(memory: dict[str, Any], score_value: float) -> tuple[str, str]:
+    info = _memory_info(memory)
+    event_status = str(info.get("event_status") or "uncertain").strip().lower()
+    if event_status in {"completed", "cancelled"}:
+        return "completed_or_cancelled", "事件已经完成或取消，时间紧迫度不加分。"
+
+    event_time = _memory_event_time(memory)
+    if event_time is None:
+        return "no_event_time", "记忆没有保存可用于计算紧迫度的事件时间。"
+    if _parse_datetime(event_time) is None:
+        return "invalid_event_time", "保存的事件时间无法解析，初评时按无有效时间计 0 分。"
+
+    labels_by_score = {
+        0.0: ("expired_over_24_hours", "事件时间已经过去超过 24 小时。"),
+        20.0: ("within_24_hours", "评估时距离事件时间不超过 24 小时。"),
+        16.0: ("within_72_hours", "事件时间位于首次评估后的 72 小时内。"),
+        12.0: ("within_7_days", "事件时间位于首次评估后的 7 天内。"),
+        6.0: ("within_30_days", "事件时间位于首次评估后的 30 天内。"),
+        2.0: ("later_than_30_days", "事件时间晚于首次评估时间 30 天以上。"),
+    }
+    if score_value not in labels_by_score:
+        raise ValueError("Topic 透明追踪中的紧迫度分值不属于当前规则")
+    return labels_by_score[score_value]
+
+
+def _topic_trace_dimensions(
+    memory: dict[str, Any],
+    assessment: dict[str, Any],
+) -> list[dict[str, Any]]:
+    breakdown = assessment.get("score_breakdown")
+    reasons = assessment.get("reasons")
+    if not isinstance(breakdown, dict) or not isinstance(reasons, dict):
+        raise TypeError("Topic 透明追踪缺少单条记忆评分明细")
+
+    dimensions = []
+    for key, title, points_key, rubric, source in _TRACE_DIMENSION_SPECS:
+        label = _trace_string(assessment, key)
+        if label not in rubric:
+            raise ValueError(f"Topic 透明追踪中的 {key} 标签无效")
+        reason = _trace_string(reasons, key)
+        score_value = _trace_number(breakdown, points_key)
+        dimension_source = source
+        if key == "effort" and score_value > float(rubric[label]):
+            dimension_source = "duration_rule"
+            reason = f"事件时长规则将该项提高到 {score_value:g} 分；模型依据：{reason}"
+        dimensions.append(
+            {
+                "key": key,
+                "title": title,
+                "label": label,
+                "score_value": score_value,
+                "score_unit": "points",
+                "max_value": float(max(rubric.values())),
+                "source": dimension_source,
+                "reason": reason,
+            }
+        )
+
+    urgency_points = _trace_number(breakdown, "urgency_points")
+    urgency_label, urgency_reason = _urgency_trace_label(memory, urgency_points)
+    dimensions.insert(
+        2,
+        {
+            "key": "urgency",
+            "title": "时间紧迫度",
+            "label": urgency_label,
+            "score_value": urgency_points,
+            "score_unit": "points",
+            "max_value": max(_URGENCY_RUBRIC.values()),
+            "source": "time_rule",
+            "reason": urgency_reason,
+        },
+    )
+
+    confidence_label = _trace_string(assessment, "confidence")
+    if confidence_label not in CONFIDENCE_FACTORS:
+        raise ValueError("Topic 透明追踪中的 confidence 标签无效")
+    confidence_factor = _trace_number(breakdown, "confidence_factor")
+    dimensions.append(
+        {
+            "key": "confidence",
+            "title": "证据置信度",
+            "label": confidence_label,
+            "score_value": confidence_factor,
+            "score_unit": "multiplier",
+            "max_value": max(CONFIDENCE_FACTORS.values()),
+            "source": "model",
+            "reason": f"模型将本次判断的置信度标记为 {confidence_label}。",
+        }
+    )
+    return dimensions
+
+
+def _unavailable_topic_trace(topic: dict[str, Any], reason: str) -> dict[str, Any]:
+    selection_version = topic.get("selection_version")
+    if isinstance(selection_version, bool) or not isinstance(selection_version, (int, float)):
+        selection_version = None
+    return {
+        "topic_id": str(topic.get("topic_id") or ""),
+        "topic_key": str(topic.get("topic_key") or ""),
+        "available": False,
+        "unavailable_reason": reason,
+        "selection_version": selection_version,
+        "policy": None,
+        "grouping": None,
+        "decision": None,
+        "memories": [],
+    }
 
 
 class TopicStore:
@@ -734,6 +938,202 @@ class TopicStore:
         if scope is None or topic_key not in scope["topics"]:
             return None
         return dict(scope["topics"][topic_key])
+
+    def topic_selection_trace(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        topic_id: str,
+        seat_limit: int = 15,
+    ) -> dict[str, Any] | None:
+        """Project saved state without recalculation; current_score is the Topic snapshot score."""
+        state = self._read()
+        scope = self._scope(state, user_id, cube_id)
+        if scope is None:
+            return None
+
+        topic = next(
+            (
+                item
+                for item in scope["topics"].values()
+                if isinstance(item, dict) and str(item.get("topic_id") or "") == topic_id
+            ),
+            None,
+        )
+        if topic is None:
+            return None
+        if topic.get("selection_version") != TOPIC_SELECTION_VERSION:
+            return _unavailable_topic_trace(
+                topic,
+                "历史 Topic 未保存完整的单条记忆初评过程。",
+            )
+
+        try:
+            supporting_memory_ids_raw = topic.get("supporting_memory_ids")
+            if not isinstance(supporting_memory_ids_raw, list) or not supporting_memory_ids_raw:
+                raise ValueError("Topic 透明追踪缺少支持记忆")
+            supporting_memory_ids = [
+                str(memory_id).strip() for memory_id in supporting_memory_ids_raw
+            ]
+            if any(not memory_id for memory_id in supporting_memory_ids):
+                raise ValueError("Topic 透明追踪包含无效的支持记忆 ID")
+
+            score_breakdown = topic.get("score_breakdown")
+            if not isinstance(score_breakdown, dict):
+                raise TypeError("Topic 透明追踪缺少 Topic 分数明细")
+            base_score = _trace_number(score_breakdown, "base_score")
+            recency_factor = _trace_number(score_breakdown, "recency_factor")
+            rank_score = _trace_number(score_breakdown, "rank_score")
+
+            counted_memory_ids_raw = score_breakdown.get("counted_memory_ids")
+            memory_scores = score_breakdown.get("memory_scores")
+            if not isinstance(counted_memory_ids_raw, list) or not isinstance(memory_scores, dict):
+                raise TypeError("Topic 透明追踪缺少记忆计分结果")
+            counted_memory_ids = {
+                str(memory_id).strip()
+                for memory_id in counted_memory_ids_raw
+                if str(memory_id).strip()
+            }
+
+            candidate_reasons_raw = topic.get("candidate_reasons")
+            if not isinstance(candidate_reasons_raw, list) or any(
+                not isinstance(reason, str) for reason in candidate_reasons_raw
+            ):
+                raise ValueError("Topic 透明追踪缺少候选判定原因")
+            candidate_reasons = [
+                reason.strip() for reason in candidate_reasons_raw if reason.strip()
+            ]
+
+            topic_kind = _trace_string(topic, "topic_kind")
+            grouping_reason = _trace_string(topic, "grouping_reason")
+            candidate_tag_keys_raw = topic.get("candidate_tag_keys")
+            if not isinstance(candidate_tag_keys_raw, list) or any(
+                not isinstance(key, str) for key in candidate_tag_keys_raw
+            ):
+                raise ValueError("Topic 透明追踪缺少候选标签")
+            candidate_tag_keys = [key.strip() for key in candidate_tag_keys_raw if key.strip()]
+
+            ranked_topics = [
+                item
+                for item in scope["topics"].values()
+                if isinstance(item, dict)
+                and item.get("lifecycle_status") in {"active", "suppressed"}
+            ]
+            ranked_topics.sort(
+                key=lambda item: (
+                    -_trace_number(item, "rank_score"),
+                    -_datetime_sort_value(item.get("last_evidence_at")),
+                    str(item.get("topic_key") or ""),
+                )
+            )
+            rank_position = next(
+                (
+                    index
+                    for index, item in enumerate(ranked_topics, start=1)
+                    if str(item.get("topic_id") or "") == topic_id
+                ),
+                None,
+            )
+            if rank_position is None:
+                raise ValueError("Topic 当前不在滚动席位候选池中")
+            seat_status = _trace_string(topic, "lifecycle_status")
+
+            memories = []
+            for memory_id in supporting_memory_ids:
+                record = scope["memories"].get(memory_id)
+                assessment = scope["assessments"].get(memory_id)
+                tags_raw = scope["tags"].get(memory_id)
+                if not isinstance(record, dict) or not isinstance(assessment, dict):
+                    raise TypeError(f"记忆 {memory_id} 缺少初评状态")
+                if assessment.get("selection_version") != TOPIC_SELECTION_VERSION:
+                    raise ValueError(f"记忆 {memory_id} 的初评版本不支持透明追踪")
+                if not isinstance(tags_raw, list):
+                    raise TypeError(f"记忆 {memory_id} 缺少候选标签状态")
+
+                stored_memory = record.get("memory")
+                if not isinstance(stored_memory, dict):
+                    raise TypeError(f"记忆 {memory_id} 缺少正文快照")
+                active = record.get("active")
+                eligible = assessment.get("eligible")
+                if not isinstance(active, bool) or not isinstance(eligible, bool):
+                    raise TypeError(f"记忆 {memory_id} 缺少资格状态")
+
+                dimensions = _topic_trace_dimensions(stored_memory, assessment)
+                initial_score = _trace_number(assessment, "score")
+                current_score = _trace_number(memory_scores, memory_id)
+                confidence_dimension = next(
+                    dimension for dimension in dimensions if dimension["key"] == "confidence"
+                )
+                raw_points = round(
+                    sum(
+                        float(dimension["score_value"])
+                        for dimension in dimensions
+                        if dimension["score_unit"] == "points"
+                    ),
+                    2,
+                )
+
+                tags = []
+                for raw_tag in tags_raw:
+                    if not isinstance(raw_tag, dict):
+                        raise TypeError(f"记忆 {memory_id} 包含无效候选标签")
+                    tags.append(
+                        {
+                            "topic_key": _trace_string(raw_tag, "topic_key"),
+                            "tag_name": _trace_string(raw_tag, "tag_name"),
+                            "relationship": _trace_string(raw_tag, "relationship"),
+                            "reason": _trace_string(raw_tag, "reason"),
+                        }
+                    )
+
+                assessed_at_raw = record.get("processed_at")
+                assessed_at = assessed_at_raw if isinstance(assessed_at_raw, str) else None
+                memories.append(
+                    {
+                        "memory_id": memory_id,
+                        "text": _memory_text(stored_memory),
+                        "active": active,
+                        "assessed_at": assessed_at,
+                        "eligible": eligible,
+                        "initial_score": initial_score,
+                        "current_score": current_score,
+                        "counting_status": (
+                            "counted" if memory_id in counted_memory_ids else "duplicate"
+                        ),
+                        "raw_points": raw_points,
+                        "confidence_factor": float(confidence_dimension["score_value"]),
+                        "dimensions": dimensions,
+                        "tags": tags,
+                    }
+                )
+        except (KeyError, StopIteration, TypeError, ValueError) as exc:
+            return _unavailable_topic_trace(topic, str(exc))
+
+        return {
+            "topic_id": str(topic["topic_id"]),
+            "topic_key": str(topic["topic_key"]),
+            "available": True,
+            "unavailable_reason": None,
+            "selection_version": TOPIC_SELECTION_VERSION,
+            "policy": _topic_trace_policy(seat_limit),
+            "grouping": {
+                "topic_kind": topic_kind,
+                "reason": grouping_reason,
+                "candidate_tag_keys": candidate_tag_keys,
+                "memory_ids": supporting_memory_ids,
+            },
+            "decision": {
+                "qualifies": base_score >= TOPIC_SCORE_THRESHOLD,
+                "base_score": base_score,
+                "recency_factor": recency_factor,
+                "rank_score": rank_score,
+                "rank_position": rank_position,
+                "seat_status": seat_status,
+                "candidate_reasons": candidate_reasons,
+            },
+            "memories": memories,
+        }
 
     def grouping_cache(self, user_id: str, cube_id: str) -> dict[str, list[MemoryGroup]]:
         state = self._read()
@@ -1665,6 +2065,12 @@ def _memory_info(memory: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _is_active_event_memory(memory: dict[str, Any]) -> bool:
+    metadata = memory.get("metadata")
+    status = metadata.get("status", "activated") if isinstance(metadata, dict) else "activated"
+    return status == "activated" and _memory_info(memory).get("record_type") == "event"
+
+
 def _memory_event_time(memory: dict[str, Any]) -> str | None:
     info = _memory_info(memory)
     value = info.get("event_time") or info.get("event_start_at") or info.get("event_end_at")
@@ -1730,24 +2136,18 @@ def parse_memory_assessment(
     if not isinstance(assessment.get("eligible"), bool):
         raise TypeError("assessment.eligible 必须是布尔值")
 
-    agency = str(assessment.get("agency") or "").strip().lower()
-    if agency not in AGENCY_POINTS:
-        raise ValueError(f"不支持的 assessment.agency：{agency or '空值'}")
-    action_requirement = str(assessment.get("action_requirement") or "").strip().lower()
-    if action_requirement not in ACTION_POINTS:
-        raise ValueError(f"不支持的 assessment.action_requirement：{action_requirement or '空值'}")
-    impact = str(assessment.get("impact") or "").strip().lower()
-    if impact not in IMPACT_POINTS:
-        raise ValueError(f"不支持的 assessment.impact：{impact or '空值'}")
-    explicit_priority = str(assessment.get("explicit_priority") or "").strip().lower()
-    if explicit_priority not in PRIORITY_POINTS:
-        raise ValueError(f"不支持的 assessment.explicit_priority：{explicit_priority or '空值'}")
-    effort = str(assessment.get("effort") or "").strip().lower()
-    if effort not in EFFORT_POINTS:
-        raise ValueError(f"不支持的 assessment.effort：{effort or '空值'}")
-    confidence = str(assessment.get("confidence") or "").strip().lower()
-    if confidence not in CONFIDENCE_FACTORS:
-        raise ValueError(f"不支持的 assessment.confidence：{confidence or '空值'}")
+    def validated_choice(field: str, choices: dict[str, float]) -> str:
+        value = str(assessment.get(field) or "").strip().lower()
+        if value not in choices:
+            raise ValueError(f"不支持的 assessment.{field}：{value or '空值'}")
+        return value
+
+    agency = validated_choice("agency", AGENCY_POINTS)
+    action_requirement = validated_choice("action_requirement", ACTION_POINTS)
+    impact = validated_choice("impact", IMPACT_POINTS)
+    explicit_priority = validated_choice("explicit_priority", PRIORITY_POINTS)
+    effort = validated_choice("effort", EFFORT_POINTS)
+    confidence = validated_choice("confidence", CONFIDENCE_FACTORS)
     eligible = assessment["eligible"] is True
 
     reference_now = now or datetime.now().astimezone()
@@ -1836,19 +2236,10 @@ def _refresh_memory_assessment_score(
             "memory_score": score,
         }
     )
-    return MemoryAssessment(
-        memory_id=assessment.memory_id,
-        eligible=assessment.eligible,
-        agency=assessment.agency,
-        action_requirement=assessment.action_requirement,
-        impact=assessment.impact,
-        explicit_priority=assessment.explicit_priority,
-        confidence=assessment.confidence,
+    return replace(
+        assessment,
         score=score,
         score_breakdown=breakdown,
-        reasons=assessment.reasons,
-        effort=assessment.effort,
-        selection_version=assessment.selection_version,
     )
 
 
@@ -1895,7 +2286,7 @@ def compute_topic_metrics(
     counted = sorted(best_by_text.values(), key=lambda item: item.score, reverse=True)
     scores = [item.score for item in counted]
     strongest = scores[0]
-    supporting_points = round(sum(scores[1:]) * 0.5, 2)
+    supporting_points = round(sum(scores[1:]) * TOPIC_SUPPORTING_WEIGHT, 2)
     base_score = round(min(100.0, strongest + supporting_points), 2)
 
     observed = [
@@ -2044,10 +2435,9 @@ def parse_memory_groups(raw: dict[str, Any], allowed_memory_ids: list[str]) -> l
         raw_ids = item.get("memory_ids")
         if not isinstance(raw_ids, list) or not raw_ids:
             raise ValueError("Topic 分组必须包含非空 memory_ids")
-        cleaned_ids = [str(value).strip() for value in raw_ids if str(value).strip()]
-        if len(cleaned_ids) != len(set(cleaned_ids)):
+        memory_ids = [str(value).strip() for value in raw_ids if str(value).strip()]
+        if len(memory_ids) != len(set(memory_ids)):
             raise ValueError("Topic 分组在同一小组中重复使用了 memory_id")
-        memory_ids = list(cleaned_ids)
         if not memory_ids:
             raise ValueError("Topic 分组必须包含有效 memory_id")
         unknown = set(memory_ids) - allowed
@@ -2102,6 +2492,13 @@ def build_candidate_components(
         if left_root != right_root:
             parent[right_root] = left_root
 
+    def union_all(related_memory_ids: list[str]) -> None:
+        if len(related_memory_ids) < 2:
+            return
+        first_memory_id = related_memory_ids[0]
+        for memory_id in related_memory_ids[1:]:
+            union(first_memory_id, memory_id)
+
     ids_by_tag: dict[str, list[str]] = {}
     for memory_id in memory_ids:
         for item in tags_by_memory.get(memory_id, []):
@@ -2109,11 +2506,7 @@ def build_candidate_components(
                 continue
             ids_by_tag.setdefault(item.topic_key, []).append(memory_id)
     for tagged_ids in ids_by_tag.values():
-        if len(tagged_ids) < 2:
-            continue
-        first = tagged_ids[0]
-        for memory_id in tagged_ids[1:]:
-            union(first, memory_id)
+        union_all(tagged_ids)
 
     ids_by_text: dict[str, list[str]] = {}
     for memory_id in memory_ids:
@@ -2121,16 +2514,26 @@ def build_candidate_components(
         if text_key:
             ids_by_text.setdefault(text_key, []).append(memory_id)
     for duplicate_ids in ids_by_text.values():
-        if len(duplicate_ids) < 2:
-            continue
-        first = duplicate_ids[0]
-        for memory_id in duplicate_ids[1:]:
-            union(first, memory_id)
+        union_all(duplicate_ids)
 
     components: dict[str, list[str]] = {}
     for memory_id in memory_ids:
         components.setdefault(find(memory_id), []).append(memory_id)
     return sorted(components.values(), key=lambda item: (item[0], len(item)))
+
+
+def _assessment_judgements(
+    assessment: MemoryAssessment,
+) -> dict[str, Any]:
+    return {
+        "agency": assessment.agency,
+        "action_requirement": assessment.action_requirement,
+        "impact": assessment.impact,
+        "explicit_priority": assessment.explicit_priority,
+        "effort": assessment.effort,
+        "confidence": assessment.confidence,
+        "reasons": assessment.reasons,
+    }
 
 
 def _selection_fingerprint(
@@ -2151,13 +2554,7 @@ def _selection_fingerprint(
                 "metadata": memory_by_id[memory_id].get("metadata", {}),
                 "assessment": {
                     "eligible": assessments_by_id[memory_id].eligible,
-                    "agency": assessments_by_id[memory_id].agency,
-                    "action_requirement": assessments_by_id[memory_id].action_requirement,
-                    "impact": assessments_by_id[memory_id].impact,
-                    "explicit_priority": assessments_by_id[memory_id].explicit_priority,
-                    "effort": assessments_by_id[memory_id].effort,
-                    "confidence": assessments_by_id[memory_id].confidence,
-                    "reasons": assessments_by_id[memory_id].reasons,
+                    **_assessment_judgements(assessments_by_id[memory_id]),
                 },
                 "tags": [asdict(item) for item in tags_by_memory.get(memory_id, [])],
             }
@@ -2237,10 +2634,7 @@ class TopicProcessor:
         reference_now = datetime.now().astimezone()
         processed_memories = 0
         for memory in memories:
-            metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
-            if metadata.get("status", "activated") != "activated":
-                continue
-            if _memory_info(memory).get("record_type") != "event":
+            if not _is_active_event_memory(memory):
                 continue
             analyze = getattr(self.llm, "analyze_memory", None)
             if not callable(analyze):
@@ -2289,24 +2683,20 @@ class TopicProcessor:
     ) -> BackfillResult:
         """Select untagged event memories already stored in MemOS and finish Topic updates."""
         memories = self.memos_client.list_memories(user_id=user_id, cube_id=cube_id)
-        selected_ids = list(
-            dict.fromkeys(
-                memory_id
-                for memory in memories
-                if (
-                    (
-                        memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
-                    ).get("status", "activated")
-                    == "activated"
-                    and _memory_info(memory).get("record_type") == "event"
-                    and (
-                        ingest_batch_id is None
-                        or _memory_info(memory).get("ingest_batch_id") == ingest_batch_id
-                    )
-                    and (memory_id := _memory_id(memory))
-                )
-            )
-        )
+        selected_ids: list[str] = []
+        seen_memory_ids: set[str] = set()
+        for memory in memories:
+            if not _is_active_event_memory(memory):
+                continue
+            if (
+                ingest_batch_id is not None
+                and _memory_info(memory).get("ingest_batch_id") != ingest_batch_id
+            ):
+                continue
+            memory_id = _memory_id(memory)
+            if memory_id and memory_id not in seen_memory_ids:
+                selected_ids.append(memory_id)
+                seen_memory_ids.add(memory_id)
         tagged_ids = self.store.tagged_memory_ids(user_id, cube_id)
         assessed_ids = self.store.assessed_memory_ids(user_id, cube_id)
         processed_ids = tagged_ids & assessed_ids
@@ -2505,21 +2895,13 @@ class TopicProcessor:
                 for memory_id in component
                 for item in tags_by_memory.get(memory_id, [])
             ]
-            component_assessments = []
-            for memory_id in component:
-                assessment = assessments_by_id[memory_id]
-                component_assessments.append(
-                    {
-                        "memory_id": assessment.memory_id,
-                        "agency": assessment.agency,
-                        "action_requirement": assessment.action_requirement,
-                        "impact": assessment.impact,
-                        "explicit_priority": assessment.explicit_priority,
-                        "effort": assessment.effort,
-                        "confidence": assessment.confidence,
-                        "reasons": assessment.reasons,
-                    }
-                )
+            component_assessments = [
+                {
+                    "memory_id": assessments_by_id[memory_id].memory_id,
+                    **_assessment_judgements(assessments_by_id[memory_id]),
+                }
+                for memory_id in component
+            ]
             raw_groups = self.llm.group_memories(
                 memories=component_memories,
                 assessments=component_assessments,

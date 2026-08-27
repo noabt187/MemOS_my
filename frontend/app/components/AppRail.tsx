@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
-import Link from "@/lib/link";
-import { Database, LayoutDashboard, LogOut, MessageSquareText, Sparkles, Upload } from "lucide-react";
-import { appApi } from "@/lib/api-client";
+import { LayoutDashboard, LogOut, MessageSquareText, Sparkles, Upload } from "lucide-react";
+import { type ReactElement, useEffect, useState } from "react";
+
+import { appApi } from "@/lib/api-client.ts";
+import Link from "@/lib/link.tsx";
 
 type AppRailProps = {
   active: "overview" | "runtime" | "topics" | "upload";
@@ -11,13 +12,25 @@ type ServiceState = "checking" | "online" | "degraded" | "offline";
 
 const items = [
   { key: "overview", href: "/", label: "总览", icon: LayoutDashboard },
-  { key: "memories", href: "/#memories", label: "记忆", icon: Database },
   { key: "runtime", href: "/runtime", label: "交互", icon: MessageSquareText },
   { key: "topics", href: "/topics", label: "Topic", icon: Sparkles },
   { key: "upload", href: "/upload", label: "上传", icon: Upload },
 ] as const;
 
-export default function AppRail({ active }: AppRailProps) {
+function getServiceLabel(serviceState: ServiceState): string {
+  switch (serviceState) {
+    case "checking":
+      return "正在检查";
+    case "online":
+      return "服务在线";
+    case "degraded":
+      return "依赖异常";
+    case "offline":
+      return "无法连接";
+  }
+}
+
+export default function AppRail({ active }: AppRailProps): ReactElement {
   const [serviceState, setServiceState] = useState<ServiceState>("checking");
 
   useEffect(() => {
@@ -30,16 +43,18 @@ export default function AppRail({ active }: AppRailProps) {
       .catch(() => {
         if (activeRequest) setServiceState("offline");
       });
-    return () => { activeRequest = false; };
+    return () => {
+      activeRequest = false;
+    };
   }, []);
 
-  const logout = async () => {
+  async function logout(): Promise<void> {
     try {
       await appApi.logout();
     } finally {
       window.location.replace("/login");
     }
-  };
+  }
 
   return (
     <aside className="rail">
@@ -47,10 +62,10 @@ export default function AppRail({ active }: AppRailProps) {
       <nav aria-label="主导航">
         {items.map((item) => {
           const Icon = item.icon;
-          const selected = item.key === active || (item.key === "memories" && active === "overview");
+          const selected = item.key === active;
           return (
             <Link
-              className={`rail-item ${selected && item.key !== "memories" ? "active" : ""}`}
+              className={`rail-item ${selected ? "active" : ""}`}
               href={item.href}
               aria-label={item.label}
               key={item.key}
@@ -67,11 +82,7 @@ export default function AppRail({ active }: AppRailProps) {
       </button>
       <div className="rail-health">
         <i className={serviceState === "online" ? "online" : ""} />
-        <span>{
-          serviceState === "checking" ? "正在检查" :
-          serviceState === "online" ? "服务在线" :
-          serviceState === "degraded" ? "依赖异常" : "无法连接"
-        }</span>
+        <span>{getServiceLabel(serviceState)}</span>
       </div>
     </aside>
   );

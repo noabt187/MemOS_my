@@ -1,18 +1,31 @@
 "use client";
 
-import { DragEvent, FormEvent, useRef, useState } from "react";
 import { CheckCircle2, FileText, Image, Link2, LoaderCircle, UploadCloud, Video } from "lucide-react";
-import AppRail from "../components/AppRail";
-import { appApi, IngestionResult } from "@/lib/api-client";
+import { type DragEvent, type FormEvent, type ReactElement, useRef, useState } from "react";
 
-function formatSize(size: number) {
+import { appApi } from "@/lib/api-client.ts";
+import type { IngestionResult } from "@/lib/api-client.ts";
+import AppRail from "../components/AppRail.tsx";
+
+type SelectedFileIconProps = {
+  file: File | null;
+};
+
+function formatSize(size: number): string {
   if (size < 1024) return `${size} B`;
   if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
   if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
   return `${(size / 1024 / 1024 / 1024).toFixed(2)} GB`;
 }
 
-export default function UploadPage() {
+function SelectedFileIcon({ file }: SelectedFileIconProps): ReactElement {
+  if (!file) return <UploadCloud size={36} />;
+  if (file.type.startsWith("video/")) return <Video size={32} />;
+  if (file.type.startsWith("image/")) return <Image size={32} />;
+  return <FileText size={32} />;
+}
+
+export default function UploadPage(): ReactElement {
   const inputRef = useRef<HTMLInputElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [instruction, setInstruction] = useState("");
@@ -24,20 +37,25 @@ export default function UploadPage() {
   const [remoteSubmitting, setRemoteSubmitting] = useState(false);
   const [remoteResult, setRemoteResult] = useState<IngestionResult | null>(null);
 
-  const chooseFile = (nextFile?: File) => {
+  function chooseFile(nextFile?: File): void {
     if (!nextFile) return;
     setFile(nextFile);
     setResult(null);
     setError("");
-  };
+  }
 
-  const onDrop = (event: DragEvent<HTMLButtonElement>) => {
+  function onDragOver(event: DragEvent<HTMLButtonElement>): void {
+    event.preventDefault();
+    setDragging(true);
+  }
+
+  function onDrop(event: DragEvent<HTMLButtonElement>): void {
     event.preventDefault();
     setDragging(false);
     chooseFile(event.dataTransfer.files[0]);
-  };
+  }
 
-  const submit = async (event: FormEvent) => {
+  async function submit(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!file || submitting) return;
     setSubmitting(true);
@@ -50,9 +68,9 @@ export default function UploadPage() {
     } finally {
       setSubmitting(false);
     }
-  };
+  }
 
-  const submitRemote = async (event: FormEvent) => {
+  async function submitRemote(event: FormEvent<HTMLFormElement>): Promise<void> {
     event.preventDefault();
     if (!remoteUrl.trim() || remoteSubmitting) return;
     setRemoteSubmitting(true);
@@ -65,7 +83,7 @@ export default function UploadPage() {
     } finally {
       setRemoteSubmitting(false);
     }
-  };
+  }
 
   return (
     <main className="shell page-shell">
@@ -86,17 +104,11 @@ export default function UploadPage() {
               className={`drop-zone ${dragging ? "dragging" : ""} ${file ? "has-file" : ""}`}
               type="button"
               onClick={() => inputRef.current?.click()}
-              onDragOver={(event) => { event.preventDefault(); setDragging(true); }}
+              onDragOver={onDragOver}
               onDragLeave={() => setDragging(false)}
               onDrop={onDrop}
             >
-              {!file ? <UploadCloud size={36} /> : file.type.startsWith("video/") ? (
-                <Video size={32} />
-              ) : file.type.startsWith("image/") ? (
-                <Image size={32} />
-              ) : (
-                <FileText size={32} />
-              )}
+              <SelectedFileIcon file={file} />
               {file ? (
                 <><strong>{file.name}</strong><span>{formatSize(file.size)} · 点击重新选择</span></>
               ) : (
