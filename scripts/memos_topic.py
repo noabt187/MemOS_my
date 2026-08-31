@@ -213,6 +213,7 @@ class CandidateMetrics:
     score_breakdown: dict[str, Any]
     candidate_reasons: list[str]
     progress_status: str = "uncertain"
+    importance_score: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -225,7 +226,7 @@ class MemoryAssessment:
     explicit_priority: str
     confidence: str
     score: float
-    score_breakdown: dict[str, float]
+    score_breakdown: dict[str, Any]
     reasons: dict[str, str]
     effort: str = "none"
     selection_version: int = 3
@@ -2198,6 +2199,7 @@ def parse_memory_assessment(
     now: datetime | None = None,
 ) -> MemoryAssessment:
     """Validate model judgements and calculate one inspectable memory score."""
+    del now  # Time changes queue priority later; it must not change static importance.
     memory_id = _memory_id(memory)
     if not memory_id:
         raise ValueError("Topic 不能评估没有 memory_id 的记忆")
@@ -2221,22 +2223,13 @@ def parse_memory_assessment(
     confidence = validated_choice("confidence", CONFIDENCE_FACTORS)
     eligible = assessment["eligible"] is True
 
-    reference_now = now or datetime.now().astimezone()
     agency_points = AGENCY_POINTS[agency]
     action_points = ACTION_POINTS[action_requirement]
-    urgency_points = _memory_urgency_points(memory, reference_now)
     impact_points = IMPACT_POINTS[impact]
     priority_points = PRIORITY_POINTS[explicit_priority]
     effort_points = max(EFFORT_POINTS[effort], _memory_effort_points(memory))
     confidence_factor = CONFIDENCE_FACTORS[confidence]
-    raw_score = (
-        agency_points
-        + action_points
-        + urgency_points
-        + impact_points
-        + priority_points
-        + effort_points
-    )
+    raw_score = agency_points + action_points + impact_points + priority_points + effort_points
     score = round(min(100.0, raw_score) * confidence_factor, 2) if eligible else 0.0
 
     reasons_raw = assessment.get("reasons")
@@ -2255,12 +2248,16 @@ def parse_memory_assessment(
         score_breakdown={
             "agency_points": agency_points,
             "action_points": action_points,
-            "urgency_points": urgency_points,
+            # Kept as a zero-valued compatibility field for old traces. Time is
+            # represented separately by approaching_bonus in the queue policy.
+            "urgency_points": 0.0,
             "impact_points": impact_points,
             "priority_points": priority_points,
             "effort_points": effort_points,
             "confidence_factor": confidence_factor,
             "memory_score": score,
+            "importance_score": score,
+            "model": "static_importance_v3",
         },
         reasons=reasons,
         effort=effort,
@@ -2277,10 +2274,13 @@ def _refresh_memory_assessment_score(
     assessment: MemoryAssessment,
     now: datetime,
 ) -> MemoryAssessment:
-    """Recalculate deterministic time-sensitive points from saved model judgements."""
+    """Normalize old saved assessments to the current static-importance model."""
+    del memory, now
     if not assessment.eligible:
         return assessment
     breakdown = dict(assessment.score_breakdown)
+    if breakdown.get("model") == "static_importance_v3":
+        return assessment
     confidence_factor = float(
         breakdown.get("confidence_factor", CONFIDENCE_FACTORS.get(assessment.confidence, 0.5))
     )
@@ -2298,13 +2298,14 @@ def _refresh_memory_assessment_score(
         fixed_points = max(0.0, assessment.score / confidence_factor - old_urgency)
     else:
         fixed_points = 0.0
-    urgency_points = _memory_urgency_points(memory, now)
-    score = round(min(100.0, fixed_points + urgency_points) * confidence_factor, 2)
+    score = round(min(100.0, fixed_points) * confidence_factor, 2)
     breakdown.update(
         {
-            "urgency_points": urgency_points,
+            "urgency_points": 0.0,
             "confidence_factor": confidence_factor,
             "memory_score": score,
+            "importance_score": score,
+            "model": "static_importance_v3",
         }
     )
     return replace(
@@ -2346,6 +2347,7 @@ def compute_topic_metrics(
                 "rank_score": 0.0,
             },
             candidate_reasons=[],
+            importance_score=0.0,
         )
 
     best_by_text: dict[str, MemoryAssessment] = {}
@@ -2366,8 +2368,10 @@ def compute_topic_metrics(
         if (parsed := _parse_datetime(_memory_observed_at(memory_by_id[item.memory_id])))
     ]
     latest = max(observed) if observed else None
-    recency_factor = _recency_factor(latest, reference_now)
-    rank_score = calculate_rank_score(base_score=base_score, recency_factor=recency_factor)
+    # Legacy consumers still read base_score/recency_factor/rank_score. Keep
+    # those aliases stable while the queue layer owns all time-based changes.
+    recency_factor = 1.0
+    rank_score = base_score
     status_observations = [
         (
             _parse_datetime(_memory_observed_at(memory_by_id[item.memory_id])),
@@ -2399,6 +2403,8 @@ def compute_topic_metrics(
             "supporting_memory_points": supporting_points,
             "duplicate_memory_count": len(valid) - len(counted),
             "counted_memory_ids": [item.memory_id for item in counted],
+            "model": "static_importance_v3",
+            "importance_score": base_score,
             "base_score": base_score,
             "recency_factor": recency_factor,
             "rank_score": rank_score,
@@ -2406,6 +2412,7 @@ def compute_topic_metrics(
         },
         candidate_reasons=candidate_reasons,
         progress_status=progress_status,
+        importance_score=base_score,
     )
 
 

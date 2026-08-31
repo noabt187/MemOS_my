@@ -268,20 +268,22 @@ def test_memory_importance_is_calculated_from_discrete_model_judgements():
         now=datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
     )
 
-    assert assessment.score == 80.0
+    assert assessment.score == 60.0
     assert assessment.score_breakdown == {
         "agency_points": 25.0,
         "action_points": 25.0,
-        "urgency_points": 20.0,
+        "urgency_points": 0.0,
         "impact_points": 10.0,
         "priority_points": 0.0,
         "effort_points": 0.0,
         "confidence_factor": 1.0,
-        "memory_score": 80.0,
+        "memory_score": 60.0,
+        "importance_score": 60.0,
+        "model": "static_importance_v3",
     }
 
 
-def test_topic_metrics_recalculate_urgency_as_the_deadline_gets_closer():
+def test_topic_metrics_keep_importance_static_as_the_deadline_gets_closer():
     memory = {
         "id": "memory-deadline",
         "memory": "用户计划在8月30日提交材料。",
@@ -310,7 +312,7 @@ def test_topic_metrics_recalculate_urgency_as_the_deadline_gets_closer():
         },
         now=datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
     )
-    assert assessment.score == 12
+    assert assessment.score == 0
 
     metrics = memos_topic.compute_topic_metrics(
         assessments=[assessment],
@@ -319,7 +321,56 @@ def test_topic_metrics_recalculate_urgency_as_the_deadline_gets_closer():
         threshold=0,
     )
 
-    assert metrics.score_breakdown["memory_scores"]["memory-deadline"] == 20
+    assert metrics.score_breakdown["memory_scores"]["memory-deadline"] == 0
+    assert metrics.score_breakdown["importance_score"] == 0
+    assert metrics.score_breakdown["recency_factor"] == 1
+    assert metrics.score_breakdown["rank_score"] == 0
+
+
+def test_legacy_assessment_removes_old_urgency_without_changing_static_dimensions():
+    memory = {
+        "id": "memory-legacy",
+        "memory": "用户计划明天参加面试。",
+        "metadata": {
+            "created_at": "2026-08-25T09:00:00+08:00",
+            "info": {
+                "record_type": "event",
+                "event_status": "planned",
+                "event_time": "2026-08-26T10:00:00+08:00",
+            },
+        },
+    }
+    legacy = memos_topic.MemoryAssessment(
+        memory_id="memory-legacy",
+        eligible=True,
+        agency="committed",
+        action_requirement="must_do",
+        impact="meaningful",
+        explicit_priority="none",
+        confidence="high",
+        score=80,
+        score_breakdown={
+            "agency_points": 25,
+            "action_points": 25,
+            "urgency_points": 20,
+            "impact_points": 10,
+            "priority_points": 0,
+            "effort_points": 0,
+            "confidence_factor": 1,
+            "memory_score": 80,
+        },
+        reasons={},
+    )
+
+    metrics = memos_topic.compute_topic_metrics(
+        assessments=[legacy],
+        memories=[memory],
+        now=datetime.fromisoformat("2026-08-25T10:00:00+08:00"),
+    )
+
+    assert metrics.qualifies is True
+    assert metrics.importance_score == 60
+    assert metrics.score_breakdown["memory_scores"] == {"memory-legacy": 60}
 
 
 def test_old_unfinished_event_does_not_keep_full_urgency_forever():
