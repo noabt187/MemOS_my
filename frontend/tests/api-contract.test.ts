@@ -129,7 +129,7 @@ test("parses a transparent Topic selection trace without recalculating scores", 
     topic_key: "interview",
     available: true,
     unavailable_reason: null,
-    selection_version: 2,
+    selection_version: 3,
     policy: {
       topic_threshold: 60,
       supporting_weight: 0.5,
@@ -149,6 +149,7 @@ test("parses a transparent Topic selection trace without recalculating scores", 
     grouping: {
       topic_kind: "event",
       reason: "同一次面试安排。",
+      shared_anchor: "A公司技术面试",
       candidate_tag_keys: ["interview"],
       memory_ids: ["memory-1"],
     },
@@ -203,6 +204,7 @@ test("parses a transparent Topic selection trace without recalculating scores", 
     assert.fail("expected an available trace");
   }
   assert.equal(trace.decision.rank_score, 72);
+  assert.equal(trace.grouping.shared_anchor, "A公司技术面试");
 });
 
 test("keeps unavailable historical Topic traces explicit instead of inventing scores", function (): void {
@@ -232,7 +234,7 @@ test("rejects incomplete Topic trace dimensions instead of defaulting their scor
     topic_key: "interview",
     available: true,
     unavailable_reason: null,
-    selection_version: 2,
+    selection_version: 3,
     policy: {
       topic_threshold: 60,
       supporting_weight: 0.5,
@@ -245,6 +247,7 @@ test("rejects incomplete Topic trace dimensions instead of defaulting their scor
     grouping: {
       topic_kind: "event",
       reason: "same event",
+      shared_anchor: null,
       candidate_tag_keys: [],
       memory_ids: ["memory-1"],
     },

@@ -257,6 +257,10 @@ export default function TopicProcessTrace({
           <dl>
             <div><dt>分组类型</dt><dd>{getTopicKindLabel(trace.grouping.topic_kind)}</dd></div>
             <div><dt>组内记忆</dt><dd>{trace.grouping.memory_ids.length} 条</dd></div>
+            <div>
+              <dt>具体共同事项</dt>
+              <dd>{trace.grouping.shared_anchor || "单条事件，无需共同事项"}</dd>
+            </div>
           </dl>
           <blockquote>{trace.grouping.reason}</blockquote>
           <div className="trace-key-list">

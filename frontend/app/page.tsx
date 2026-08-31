@@ -421,7 +421,10 @@ export default function Home(): ReactElement {
                     {[
                       ["记录类型", selectedMemory.structured.record_type],
                       ["事件标题", selectedMemory.structured.event_title],
-                      ["事件时间", selectedMemory.structured.event_time || selectedMemory.structured.event_start_at],
+                      ["事件时间", selectedMemory.structured.event_time],
+                      ["开始时间", selectedMemory.structured.event_start_time || selectedMemory.structured.event_start_at],
+                      ["结束时间", selectedMemory.structured.event_end_time || selectedMemory.structured.event_end_at],
+                      ["原始时间表达", selectedMemory.structured.event_time_text],
                       ["事件状态", selectedMemory.structured.event_status],
                       ["行动者", selectedMemory.structured.event_actor],
                       ["行为", selectedMemory.structured.event_action],

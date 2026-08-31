@@ -10,6 +10,7 @@ promotion/eviction decision is calculated by deterministic rules in this file.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sqlite3
@@ -84,14 +85,15 @@ GROUP_PROMPT = """你是个人记忆 Topic 分组检查器。
 候选记忆已经通过标签做了初筛，但相同标签不代表同一件事。请根据每条记忆的正文、时间和标签，把它们分成能够共同说明一个具体 Topic 的小组。
 
 规则：
-1. 同一事件的通知、准备、进展和结果可以放在一组。
-2. 不同事件只有在共同体现一个具体、清晰的持续兴趣或行为时，才能放在一个 pattern 小组。
-3. 仅仅属于同一大类、使用同一应用、人物相同或都带有“日程管理”等宽泛标签，不能作为合并理由。
-4. 如果只能得到“用户有一些日程”“用户使用某应用”等空泛结论，必须拆开。
-5. 每个输入 memory_id 必须且只能出现一次；不确定时保留为单条小组。
-6. topic_kind 只能是 event 或 pattern。
-7. 不得编造 memory_id 或记忆中不存在的事实。
-8. 不负责打分，只输出 JSON。
+1. 同一件具体事情的通知、准备、进展和结果可以放在一组。
+2. 多条记忆合并时，必须给出 shared_anchor：能够从每条记忆中直接找到的具体共同对象，例如同一场面试、同一项考试或同一个明确任务。不能只写“项目”“任务”“日程”“开发”等类别词。
+3. 两个不同任务即使属于同一项目，也不应仅凭项目名自动合并；只有它们共同说明同一个具体关注事项时才合并。
+4. 仅仅属于同一大类、使用同一应用、人物相同或候选标签相同，不能作为合并理由。
+5. 无法给出可靠 shared_anchor 时必须拆开；单条小组的 shared_anchor 使用 null。
+6. 每个输入 memory_id 必须且只能出现一次；不确定时保留为单条小组。
+7. topic_kind 只能是 event。这里的目标是选出用户当前最关心的具体事件，不生成项目层级或宽泛兴趣分类。
+8. 不得编造 memory_id 或记忆中不存在的事实。
+9. 不负责打分，只输出 JSON。
 
 输出格式：
 {
@@ -99,6 +101,7 @@ GROUP_PROMPT = """你是个人记忆 Topic 分组检查器。
     {
       "memory_ids": ["真实记忆ID"],
       "topic_kind": "event",
+      "shared_anchor": null,
       "reason": "这些记忆为什么能共同说明一个具体 Topic"
     }
   ]
@@ -225,7 +228,7 @@ class MemoryAssessment:
     score_breakdown: dict[str, float]
     reasons: dict[str, str]
     effort: str = "none"
-    selection_version: int = 2
+    selection_version: int = 3
 
 
 @dataclass(frozen=True)
@@ -233,6 +236,7 @@ class MemoryGroup:
     memory_ids: list[str]
     topic_kind: str
     reason: str
+    shared_anchor: str | None = None
 
 
 @dataclass(frozen=True)
@@ -317,7 +321,7 @@ EFFORT_POINTS = {"none": 0.0, "some": 3.0, "substantial": 5.0}
 CONFIDENCE_FACTORS = {"low": 0.5, "medium": 0.8, "high": 1.0}
 TOPIC_SCORE_THRESHOLD = 60.0
 TOPIC_SUPPORTING_WEIGHT = 0.5
-TOPIC_SELECTION_VERSION = 2
+TOPIC_SELECTION_VERSION = 3
 TOPIC_SCORE_REFRESH_SECONDS = 15 * 60
 
 _TRACE_DIMENSION_SPECS = (
@@ -810,6 +814,8 @@ class TopicStore:
             "memory_type": memory.get("memory_type"),
             "metadata": {
                 "status": original_metadata.get("status", "activated"),
+                "version": original_metadata.get("version", 1),
+                "updated_at": original_metadata.get("updated_at"),
                 "created_at": (
                     original_metadata.get("created_at") or memory.get("created_at") or observed_at
                 ),
@@ -824,8 +830,28 @@ class TopicStore:
             "observed_at": observed_at,
             "active": True,
             "processed_at": _now_iso(),
+            "revision": _memory_revision(memory),
         }
         self._write(state)
+
+    def stored_memory_revision(
+        self,
+        user_id: str,
+        cube_id: str,
+        memory_id: str,
+    ) -> str | None:
+        state = self._read()
+        scope = self._scope(state, user_id, cube_id)
+        if scope is None:
+            return None
+        record = scope["memories"].get(memory_id)
+        if not isinstance(record, dict):
+            return None
+        revision = record.get("revision")
+        if isinstance(revision, str) and revision:
+            return revision
+        stored_memory = record.get("memory")
+        return _memory_revision(stored_memory) if isinstance(stored_memory, dict) else None
 
     def replace_tags(
         self,
@@ -1007,6 +1033,12 @@ class TopicStore:
 
             topic_kind = _trace_string(topic, "topic_kind")
             grouping_reason = _trace_string(topic, "grouping_reason")
+            grouping_anchor_raw = topic.get("grouping_anchor")
+            grouping_anchor = (
+                grouping_anchor_raw.strip()
+                if isinstance(grouping_anchor_raw, str) and grouping_anchor_raw.strip()
+                else None
+            )
             candidate_tag_keys_raw = topic.get("candidate_tag_keys")
             if not isinstance(candidate_tag_keys_raw, list) or any(
                 not isinstance(key, str) for key in candidate_tag_keys_raw
@@ -1120,6 +1152,7 @@ class TopicStore:
             "grouping": {
                 "topic_kind": topic_kind,
                 "reason": grouping_reason,
+                "shared_anchor": grouping_anchor,
                 "candidate_tag_keys": candidate_tag_keys,
                 "memory_ids": supporting_memory_ids,
             },
@@ -1233,6 +1266,7 @@ class TopicStore:
         metrics: CandidateMetrics,
         topic_kind: str | None = None,
         grouping_reason: str | None = None,
+        grouping_anchor: str | None = None,
         candidate_tag_keys: list[str] | None = None,
         selection_fingerprint: str | None = None,
     ) -> None:
@@ -1253,6 +1287,7 @@ class TopicStore:
             topic["topic_kind"] = topic_kind
         if grouping_reason is not None:
             topic["grouping_reason"] = grouping_reason
+        topic["grouping_anchor"] = grouping_anchor
         if candidate_tag_keys is not None:
             topic["candidate_tag_keys"] = candidate_tag_keys
         if selection_fingerprint is not None:
@@ -1300,6 +1335,15 @@ class TopicStore:
             for memory_id, record in scope["memories"].items()
             if record.get("active", False)
         )
+
+    def active_memory_scopes(self, memory_id: str) -> list[tuple[str, str]]:
+        state = self._read()
+        result = []
+        for scope in state["scopes"].values():
+            record = scope["memories"].get(memory_id)
+            if isinstance(record, dict) and record.get("active", False):
+                result.append((str(scope["user_id"]), str(scope["cube_id"])))
+        return result
 
     def tagged_memory_ids(self, user_id: str, cube_id: str) -> set[str]:
         """Return memories whose Topic tag extraction has completed, including empty results."""
@@ -1386,6 +1430,7 @@ class TopicStore:
         rank_score: float | None = None,
         topic_kind: str = "event",
         grouping_reason: str = "",
+        grouping_anchor: str | None = None,
         candidate_tag_keys: list[str] | None = None,
         selection_fingerprint: str = "",
     ) -> str:
@@ -1421,6 +1466,7 @@ class TopicStore:
             "progress_status": metrics.progress_status,
             "topic_kind": topic_kind,
             "grouping_reason": grouping_reason,
+            "grouping_anchor": grouping_anchor,
             "candidate_tag_keys": list(candidate_tag_keys or []),
             "selection_version": TOPIC_SELECTION_VERSION,
             "selection_fingerprint": selection_fingerprint,
@@ -1688,9 +1734,11 @@ def migrate_legacy_sqlite(
                         row["observed_at"] or memory_record.get("observed_at") or _now_iso()
                     ),
                     event_time=str(
-                        info.get("event_start_at")
-                        or info.get("event_end_at")
+                        info.get("event_start_time")
+                        or info.get("event_end_time")
                         or info.get("event_time")
+                        or info.get("event_start_at")
+                        or info.get("event_end_at")
                         or ""
                     )
                     or None,
@@ -2038,6 +2086,21 @@ def _memory_text(memory: dict[str, Any]) -> str:
     return str(memory.get("memory") or memory.get("value") or "").strip()
 
 
+def _memory_revision(memory: dict[str, Any]) -> str:
+    """Fingerprint the MemOS fields that can change Topic selection."""
+    metadata = memory.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    payload = {
+        "memory": _memory_text(memory),
+        "version": metadata.get("version"),
+        "updated_at": metadata.get("updated_at"),
+        "status": metadata.get("status", "activated"),
+        "info": _memory_info(memory),
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
 def _memory_info(memory: dict[str, Any]) -> dict[str, Any]:
     metadata = memory.get("metadata")
     if not isinstance(metadata, dict):
@@ -2056,6 +2119,8 @@ def _memory_info(memory: dict[str, Any]) -> dict[str, Any]:
             "event_type",
             "event_status",
             "event_time",
+            "event_start_time",
+            "event_end_time",
             "event_start_at",
             "event_end_at",
             "source_recorded_at",
@@ -2073,7 +2138,13 @@ def _is_active_event_memory(memory: dict[str, Any]) -> bool:
 
 def _memory_event_time(memory: dict[str, Any]) -> str | None:
     info = _memory_info(memory)
-    value = info.get("event_time") or info.get("event_start_at") or info.get("event_end_at")
+    value = (
+        info.get("event_time")
+        or info.get("event_start_time")
+        or info.get("event_end_time")
+        or info.get("event_start_at")
+        or info.get("event_end_at")
+    )
     return str(value) if value else None
 
 
@@ -2398,7 +2469,11 @@ def parse_tag_evidence(memory: dict[str, Any], raw: dict[str, Any]) -> list[TagE
             raise ValueError(f"不支持的标签 initiative_type：{initiative_type or '空值'}")
         info = _memory_info(memory)
         event_time_raw = (
-            info.get("event_time") or info.get("event_start_at") or info.get("event_end_at")
+            info.get("event_time")
+            or info.get("event_start_time")
+            or info.get("event_end_time")
+            or info.get("event_start_at")
+            or info.get("event_end_at")
         )
         event_status = str(info.get("event_status") or "uncertain").strip().lower()
         if event_status not in STATUS_WEIGHTS:
@@ -2447,12 +2522,31 @@ def parse_memory_groups(raw: dict[str, Any], allowed_memory_ids: list[str]) -> l
         if repeated:
             raise ValueError("Topic 分组重复使用了记忆：" + "、".join(sorted(repeated)))
         topic_kind = str(item.get("topic_kind") or "event").strip().lower()
-        if topic_kind not in {"event", "pattern"}:
+        if topic_kind != "event":
             raise ValueError(f"不支持的 topic_kind：{topic_kind}")
         reason = str(item.get("reason") or "").strip()
         if not reason:
             raise ValueError("Topic 分组必须说明 reason")
-        result.append(MemoryGroup(memory_ids=memory_ids, topic_kind=topic_kind, reason=reason))
+        shared_anchor = str(item.get("shared_anchor") or "").strip() or None
+        if len(memory_ids) > 1 and shared_anchor is None:
+            result.extend(
+                MemoryGroup(
+                    memory_ids=[memory_id],
+                    topic_kind="event",
+                    reason="模型未提供可核验的具体共同事项，按单条事件独立保留",
+                )
+                for memory_id in memory_ids
+            )
+            seen.update(memory_ids)
+            continue
+        result.append(
+            MemoryGroup(
+                memory_ids=memory_ids,
+                topic_kind=topic_kind,
+                reason=reason,
+                shared_anchor=shared_anchor if len(memory_ids) > 1 else None,
+            )
+        )
         seen.update(memory_ids)
 
     # A model omission must never make a memory disappear. Keep it as a safe
@@ -2544,6 +2638,7 @@ def _selection_fingerprint(
     *,
     topic_kind: str | None = None,
     grouping_reason: str | None = None,
+    grouping_anchor: str | None = None,
 ) -> str:
     payload = {
         "memory_ids": sorted(memory_ids),
@@ -2562,6 +2657,7 @@ def _selection_fingerprint(
         ],
         "topic_kind": topic_kind,
         "grouping_reason": grouping_reason,
+        "grouping_anchor": grouping_anchor,
         "selection_version": TOPIC_SELECTION_VERSION,
     }
     serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
@@ -2700,7 +2796,14 @@ class TopicProcessor:
         tagged_ids = self.store.tagged_memory_ids(user_id, cube_id)
         assessed_ids = self.store.assessed_memory_ids(user_id, cube_id)
         processed_ids = tagged_ids & assessed_ids
-        pending_ids = [memory_id for memory_id in selected_ids if memory_id not in processed_ids]
+        selected_by_id = {_memory_id(memory): memory for memory in memories}
+        pending_ids = [
+            memory_id
+            for memory_id in selected_ids
+            if memory_id not in processed_ids
+            or self.store.stored_memory_revision(user_id, cube_id, memory_id)
+            != _memory_revision(selected_by_id[memory_id])
+        ]
         processed = self.process_memory_ids(
             memory_ids=pending_ids,
             user_id=user_id,
@@ -2721,22 +2824,36 @@ class TopicProcessor:
         """Remove Topic votes whose source memory is gone or no longer active in MemOS."""
         active_ids = self.store.active_memory_ids()
         affected: set[tuple[str, str, str]] = set()
+        changed_by_scope: dict[tuple[str, str], list[str]] = {}
         removed = 0
         for start in range(0, len(active_ids), batch_size):
             batch = active_ids[start : start + batch_size]
             memories = self.memos_client.get_by_ids(batch)
             active_returned = {
-                _memory_id(memory)
-                for memory in memories
-                if (memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}).get(
-                    "status", "activated"
-                )
-                == "activated"
+                _memory_id(memory): memory for memory in memories if _is_active_event_memory(memory)
             }
             for memory_id in batch:
                 if memory_id not in active_returned:
                     affected.update(self.store.deactivate_memory(memory_id))
                     removed += 1
+                    continue
+                memory = active_returned[memory_id]
+                revision = _memory_revision(memory)
+                for user_id, cube_id in self.store.active_memory_scopes(memory_id):
+                    current_assessments = self.store.assessed_memory_ids(user_id, cube_id)
+                    if (
+                        memory_id not in current_assessments
+                        or self.store.stored_memory_revision(user_id, cube_id, memory_id)
+                        != revision
+                    ):
+                        changed_by_scope.setdefault((user_id, cube_id), []).append(memory_id)
+
+        for (user_id, cube_id), memory_ids in changed_by_scope.items():
+            self._process_memory_ids(
+                memory_ids=list(dict.fromkeys(memory_ids)),
+                user_id=user_id,
+                cube_id=cube_id,
+            )
 
         for user_id, cube_id, topic_key in affected:
             topic = self.store.topic_record(
@@ -2962,6 +3079,7 @@ class TopicProcessor:
                 tags_by_memory,
                 topic_kind=group.topic_kind,
                 grouping_reason=group.reason,
+                grouping_anchor=group.shared_anchor,
             )
             same_members = existing is not None and {
                 str(value) for value in existing.get("supporting_memory_ids", [])
@@ -2980,6 +3098,7 @@ class TopicProcessor:
                     metrics=metrics,
                     topic_kind=group.topic_kind,
                     grouping_reason=group.reason,
+                    grouping_anchor=group.shared_anchor,
                     candidate_tag_keys=candidate_tag_keys,
                     selection_fingerprint=group_fingerprint,
                 )
@@ -3004,6 +3123,7 @@ class TopicProcessor:
                     metrics=metrics,
                     topic_kind=group.topic_kind,
                     grouping_reason=group.reason,
+                    grouping_anchor=group.shared_anchor,
                     candidate_tag_keys=candidate_tag_keys,
                     selection_fingerprint=group_fingerprint,
                 )

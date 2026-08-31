@@ -120,6 +120,7 @@ export type TopicTracePolicy = {
 export type TopicTraceGrouping = {
   topic_kind: string;
   reason: string;
+  shared_anchor: string | null;
   candidate_tag_keys: string[];
   memory_ids: string[];
 };
@@ -605,6 +606,7 @@ function parseTopicTraceGrouping(value: unknown, path: string): TopicTraceGroupi
   return {
     topic_kind: expectString(row.topic_kind, `${path}.topic_kind`),
     reason: expectString(row.reason, `${path}.reason`),
+    shared_anchor: expectNullableString(row.shared_anchor, `${path}.shared_anchor`),
     candidate_tag_keys: expectStringArray(
       row.candidate_tag_keys,
       `${path}.candidate_tag_keys`,
