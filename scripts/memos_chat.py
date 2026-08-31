@@ -106,8 +106,13 @@ VideoUploader = Callable[[Path, str, str], OSSVideoUpload]
 
 
 def _current_source_recorded_at() -> str:
-    """Return the media import time with the machine's local UTC offset."""
+    """Return the source time for content created interactively right now."""
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def _file_source_recorded_at(path: Path) -> str:
+    """Use a local file's own timestamp instead of its later import time."""
+    return datetime.fromtimestamp(path.stat().st_mtime).astimezone().isoformat(timespec="seconds")
 
 
 def _load_project_env() -> None:
@@ -649,7 +654,7 @@ class MemOSClient:
     ) -> Any:
         """Import a text file through the complete text extraction path."""
         path = _resolve_import_path(source_path)
-        source_recorded_at = _current_source_recorded_at()
+        source_recorded_at = _file_source_recorded_at(path)
         payload: dict[str, Any] = {
             "user_id": user_id,
             "writable_cube_ids": [cube_id],
@@ -686,7 +691,7 @@ class MemOSClient:
         context = DEFAULT_IMAGE_CONTEXT
         if instruction:
             context += f"\n用户额外关注：{instruction.strip()}"
-        source_recorded_at = _current_source_recorded_at()
+        source_recorded_at = _file_source_recorded_at(path)
 
         payload: dict[str, Any] = {
             "user_id": user_id,
@@ -779,7 +784,7 @@ class MemOSClient:
                             "mime_type": mime_type,
                             "file_size": len(image_data),
                             "sha256": sha256,
-                            "source_recorded_at": source_recorded_at,
+                            "source_recorded_at": _file_source_recorded_at(path),
                         },
                     }
                 )
@@ -800,6 +805,7 @@ class MemOSClient:
                 source_document = Path(source_document_path).expanduser().resolve(strict=True)
             except OSError as exc:
                 raise MemOSClientError(f"找不到来源 Markdown：{source_document_path}") from exc
+            source_recorded_at = _file_source_recorded_at(source_document)
         payload: dict[str, Any] = {
             "user_id": user_id,
             "writable_cube_ids": [cube_id],
@@ -844,6 +850,7 @@ class MemOSClient:
         video_info: dict[str, Any]
         if _is_http_url(source):
             video_info = {"url": source}
+            source_recorded_at = None
             parsed_path = Path(urllib.parse.urlparse(source).path)
             source_metadata: dict[str, Any] = {
                 "source_type": "remote_video",
@@ -852,6 +859,7 @@ class MemOSClient:
             }
         else:
             path, mime_type, file_size, sha256 = _load_video_reference(source)
+            source_recorded_at = _file_source_recorded_at(path)
             upload = self.video_uploader(path, mime_type, sha256)
             video_info = {
                 "url": upload.download_url,
@@ -874,10 +882,10 @@ class MemOSClient:
         context = DEFAULT_VIDEO_CONTEXT
         if instruction:
             context += f"\n用户额外关注：{instruction.strip()}"
-        source_recorded_at = _current_source_recorded_at()
         video_info["instruction"] = context
-        video_info["source_recorded_at"] = source_recorded_at
-        source_metadata["source_recorded_at"] = source_recorded_at
+        if source_recorded_at is not None:
+            video_info["source_recorded_at"] = source_recorded_at
+            source_metadata["source_recorded_at"] = source_recorded_at
         source_metadata["ingest_batch_id"] = f"video-{uuid.uuid4().hex}"
 
         payload: dict[str, Any] = {

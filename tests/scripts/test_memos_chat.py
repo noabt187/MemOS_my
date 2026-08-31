@@ -62,7 +62,9 @@ def test_remember_video_uploads_local_file_to_oss(tmp_path: Path):
     assert video_part["video"]["source_path"] == str(video_path.resolve())
     assert video_part["video"]["sha256"] == hashlib.sha256(video_data).hexdigest()
     assert "提取用户依次打开了哪些页面" in video_part["video"]["instruction"]
-    assert video_part["video"]["source_recorded_at"]
+    assert video_part["video"]["source_recorded_at"] == memos_chat._file_source_recorded_at(
+        video_path
+    )
     assert "base64" not in video_part["video"]["url"]
     video_uploader.assert_called_once_with(
         video_path.resolve(), "video/mp4", hashlib.sha256(video_data).hexdigest()
@@ -92,8 +94,9 @@ def test_remember_video_accepts_http_url_without_reading_a_local_file():
     video_info = payload["messages"][0]["content"][0]["video"]
     assert video_info["url"] == "https://media.example/phone-recording.mp4"
     assert video_info["instruction"] == memos_chat.DEFAULT_VIDEO_CONTEXT
-    assert video_info["source_recorded_at"]
+    assert "source_recorded_at" not in video_info
     assert payload["info"]["source_type"] == "remote_video"
+    assert "source_recorded_at" not in payload["info"]
     video_uploader.assert_not_called()
 
 
