@@ -2,7 +2,7 @@ import uuid
 
 from typing import Any, Generic, Literal, TypeVar
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 # Import message types from core types module
 from memos.log import get_logger
@@ -23,6 +23,37 @@ class BaseResponse(BaseModel, Generic[T]):
     code: int = Field(200, description="Response status code")
     message: str = Field(..., description="Response message")
     data: T | None = Field(None, description="Response data")
+
+
+class EventLifecycleTransitionRequest(BaseRequest):
+    """Exact version-checked request used by the internal plan tracker."""
+
+    user_id: str = Field(..., min_length=1, description="Owner user ID")
+    cube_id: str = Field(..., min_length=1, description="Memory cube ID")
+    memory_id: str = Field(..., min_length=1, description="Event memory ID")
+    expected_version: int = Field(..., ge=1, description="Expected current memory version")
+    to_status: Literal["due_unverified"] = Field(
+        ..., description="Only the deterministic due-without-evidence transition is allowed"
+    )
+    observed_at: AwareDatetime = Field(..., description="Timezone-aware transition observation")
+
+
+class EventLifecycleTransitionData(BaseModel):
+    """Outcome of an exact lifecycle transition."""
+
+    outcome: Literal["applied", "no_op", "conflict", "not_found"]
+    memory_id: str
+    previous_status: str | None = None
+    current_status: str | None = None
+    previous_version: int | None = None
+    current_version: int | None = None
+    reason: str
+
+
+class EventLifecycleTransitionResponse(BaseResponse[EventLifecycleTransitionData]):
+    """Internal plan-tracker transition response."""
+
+    message: str = "Event lifecycle transition processed"
 
 
 # Product API Models

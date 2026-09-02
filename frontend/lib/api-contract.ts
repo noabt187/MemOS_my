@@ -50,6 +50,19 @@ export type TopicScoreBreakdownV2 = {
   memory_scores: Record<string, number>;
 };
 
+export type TopicImportanceBreakdown = {
+  model: "static_importance_v3";
+  strongest_memory_score: number;
+  supporting_memory_points: number;
+  duplicate_memory_count: number;
+  counted_memory_ids: string[];
+  importance_score: number;
+  base_score: number;
+  memory_scores: Record<string, number>;
+  legacy_recency_factor?: number;
+  legacy_rank_score?: number;
+};
+
 export type TopicScoreBreakdownLegacy = {
   model: "legacy_evidence_v1";
   base_score: number | null;
@@ -70,24 +83,47 @@ export type TopicScoreBreakdownPartial = {
 };
 
 export type TopicScoreBreakdown =
+  | TopicImportanceBreakdown
   | TopicScoreBreakdownV2
   | TopicScoreBreakdownLegacy
   | TopicScoreBreakdownPartial;
+
+export type TopicQueueBreakdown = {
+  importance_score: number;
+  approaching_bonus: number;
+  decay_penalty: number;
+  queue_score: number;
+};
+
+export type TopicQueueStatus = "active" | "suppressed";
+export type TopicCandidateSource = "new" | "demoted" | "refreshed" | null;
+export type TopicAttentionStatus = "open" | "past_unconfirmed";
 
 export type Topic = {
   id: string;
   key: string;
   title: string;
   reason: string;
-  status: string;
+  status: TopicQueueStatus;
   progress: string;
   score: number;
+  queue_rank: number;
+  candidate_source: TopicCandidateSource;
+  attention_status: TopicAttentionStatus;
+  importance_score: number;
+  approaching_bonus: number;
+  decay_penalty: number;
+  queue_score: number;
+  queue_score_breakdown: TopicQueueBreakdown;
   supporting_memory_ids: string[];
   evidence: TopicEvidence[];
   candidate_reasons: string[];
   score_breakdown: TopicScoreBreakdown;
   first_seen_at: string | null;
   last_evidence_at: string | null;
+  core_entered_at: string | null;
+  demoted_at: string | null;
+  calculated_at: string | null;
   version: number | null;
   updated_at: string | null;
   versions: TopicVersion[];
@@ -114,6 +150,12 @@ export type TopicTracePolicy = {
   memory_formula: string;
   topic_formula: string;
   rank_formula: string;
+  queue_policy_version: number;
+  core_limit: number;
+  visible_candidate_limit: number;
+  scheduled_promotion_margin: number;
+  immediate_promotion_margin: number;
+  queue_formula: string;
   rubric: TopicTraceRubric[];
 };
 
@@ -131,7 +173,14 @@ export type TopicTraceDecision = {
   recency_factor: number;
   rank_score: number;
   rank_position: number;
-  seat_status: string;
+  seat_status: TopicQueueStatus;
+  importance_score: number;
+  approaching_bonus: number;
+  decay_penalty: number;
+  queue_score: number;
+  queue_rank: number;
+  candidate_source: TopicCandidateSource;
+  attention_status: TopicAttentionStatus;
   candidate_reasons: string[];
 };
 
@@ -229,7 +278,19 @@ export type MemoryList = {
   items: MemorySummary[];
 };
 
-export type TopicList = { total: number; items: Topic[] };
+export type TopicList = {
+  total: number;
+  returned: number;
+  pool_total: number;
+  candidate_pool_total: number;
+  core_limit: number;
+  visible_candidate_limit: number;
+  core_count: number;
+  visible_candidate_count: number;
+  hidden_candidate_count: number;
+  calculated_at: string | null;
+  items: Topic[];
+};
 
 export type TopicUpdate = {
   processed_memories: number;
@@ -293,6 +354,7 @@ const TOPIC_SCORE_V2_FIELDS = [
   "counted_memory_ids",
   "memory_scores",
 ] as const;
+const TOPIC_SCORE_V3_FIELDS = ["importance_score"] as const;
 const TOPIC_SCORE_LEGACY_FIELDS = [
   "evidence_points",
   "initiative_points",
@@ -350,6 +412,36 @@ function expectNumber(value: unknown, path: string): number {
   return value;
 }
 
+function expectNumberInRange(
+  value: unknown,
+  path: string,
+  minimum: number,
+  maximum: number,
+): number {
+  const result = expectNumber(value, path);
+  if (result < minimum || result > maximum) {
+    return fail(path, `${minimum} 到 ${maximum} 之间的数字`);
+  }
+  return result;
+}
+
+function sameNumber(left: number, right: number): boolean {
+  return Math.abs(left - right) <= 1e-9;
+}
+
+function expectIntegerInRange(
+  value: unknown,
+  path: string,
+  minimum: number,
+  maximum = Number.MAX_SAFE_INTEGER,
+): number {
+  const result = expectNumber(value, path);
+  if (!Number.isInteger(result) || result < minimum || result > maximum) {
+    return fail(path, `${minimum} 到 ${maximum} 之间的整数`);
+  }
+  return result;
+}
+
 function expectNullableNumber(value: unknown, path: string): number | null {
   if (value === null || value === undefined) {
     return null;
@@ -382,6 +474,13 @@ function expectStringArray(value: unknown, path: string): string[] {
   return expectArray(value, path).map((item, index) =>
     expectString(item, `${path}[${index}]`),
   );
+}
+
+function expectOptionalNumber(value: unknown, path: string): number | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  return expectNumber(value, path);
 }
 
 function has(row: JsonObject, key: string): boolean {
@@ -471,8 +570,86 @@ function parseNumberRecord(value: unknown, path: string): Record<string, number>
   );
 }
 
+function parseTopicCandidateSource(value: unknown, path: string): TopicCandidateSource {
+  if (value === null) {
+    return null;
+  }
+  return expectLiteral(value, ["new", "demoted", "refreshed"] as const, path);
+}
+
+function parseTopicQueueBreakdown(value: unknown, path: string): TopicQueueBreakdown {
+  const row = expectObject(value, path);
+  return {
+    importance_score: expectNumberInRange(
+      row.importance_score,
+      `${path}.importance_score`,
+      0,
+      100,
+    ),
+    approaching_bonus: expectNumberInRange(
+      row.approaching_bonus,
+      `${path}.approaching_bonus`,
+      0,
+      20,
+    ),
+    decay_penalty: expectNumberInRange(
+      row.decay_penalty,
+      `${path}.decay_penalty`,
+      0,
+      20,
+    ),
+    queue_score: expectNumberInRange(row.queue_score, `${path}.queue_score`, 0, 120),
+  };
+}
+
 function parseTopicScoreBreakdown(value: unknown, path: string): TopicScoreBreakdown {
   const row = expectObject(value, path);
+  if (TOPIC_SCORE_V3_FIELDS.some((field) => has(row, field))) {
+    const result: TopicImportanceBreakdown = {
+      model: "static_importance_v3",
+      strongest_memory_score: expectNumberInRange(
+        row.strongest_memory_score,
+        `${path}.strongest_memory_score`,
+        0,
+        100,
+      ),
+      supporting_memory_points: expectNumberInRange(
+        row.supporting_memory_points,
+        `${path}.supporting_memory_points`,
+        0,
+        100,
+      ),
+      duplicate_memory_count: expectIntegerInRange(
+        row.duplicate_memory_count,
+        `${path}.duplicate_memory_count`,
+        0,
+      ),
+      counted_memory_ids: expectStringArray(
+        row.counted_memory_ids,
+        `${path}.counted_memory_ids`,
+      ),
+      importance_score: expectNumberInRange(
+        row.importance_score,
+        `${path}.importance_score`,
+        0,
+        100,
+      ),
+      base_score: expectNumberInRange(row.base_score, `${path}.base_score`, 0, 100),
+      memory_scores: parseNumberRecord(row.memory_scores, `${path}.memory_scores`),
+    };
+    const legacyRecencyFactor = expectOptionalNumber(
+      row.recency_factor,
+      `${path}.recency_factor`,
+    );
+    const legacyRankScore = expectOptionalNumber(row.rank_score, `${path}.rank_score`);
+    if (legacyRecencyFactor !== undefined) {
+      result.legacy_recency_factor = legacyRecencyFactor;
+    }
+    if (legacyRankScore !== undefined) {
+      result.legacy_rank_score = legacyRankScore;
+    }
+    return result;
+  }
   if (TOPIC_SCORE_V2_FIELDS.some((field) => has(row, field))) {
     return {
       model: "memory_importance_v2",
@@ -529,14 +706,102 @@ function parseTopicScoreBreakdown(value: unknown, path: string): TopicScoreBreak
 
 function parseTopic(value: unknown, path: string): Topic {
   const row = expectObject(value, path);
+  const status = expectLiteral(row.status, ["active", "suppressed"] as const, `${path}.status`);
+  const candidateSource = parseTopicCandidateSource(
+    row.candidate_source,
+    `${path}.candidate_source`,
+  );
+  const attentionStatus = expectLiteral(
+    row.attention_status,
+    ["open", "past_unconfirmed"] as const,
+    `${path}.attention_status`,
+  );
+  if (status === "active" && candidateSource !== null) {
+    return fail(`${path}.candidate_source`, "核心 Topic 使用 null");
+  }
+  if (status === "suppressed" && candidateSource === null) {
+    return fail(`${path}.candidate_source`, "候选 Topic 的 new、demoted 或 refreshed");
+  }
+  if (attentionStatus === "past_unconfirmed" && status !== "suppressed") {
+    return fail(`${path}.attention_status`, "仅与 suppressed 同时出现的 past_unconfirmed");
+  }
+
+  const importanceScore = expectNumberInRange(
+    row.importance_score,
+    `${path}.importance_score`,
+    0,
+    100,
+  );
+  const approachingBonus = expectNumberInRange(
+    row.approaching_bonus,
+    `${path}.approaching_bonus`,
+    0,
+    20,
+  );
+  const decayPenalty = expectNumberInRange(
+    row.decay_penalty,
+    `${path}.decay_penalty`,
+    0,
+    20,
+  );
+  const queueScore = expectNumberInRange(row.queue_score, `${path}.queue_score`, 0, 120);
+  const queueBreakdown = parseTopicQueueBreakdown(
+    row.queue_score_breakdown,
+    `${path}.queue_score_breakdown`,
+  );
+  const score = expectNumberInRange(row.score, `${path}.score`, 0, 120);
+  if (!sameNumber(queueBreakdown.importance_score, importanceScore)) {
+    return fail(
+      `${path}.queue_score_breakdown.importance_score`,
+      `与 ${path}.importance_score 相同的数字`,
+    );
+  }
+  if (!sameNumber(queueBreakdown.approaching_bonus, approachingBonus)) {
+    return fail(
+      `${path}.queue_score_breakdown.approaching_bonus`,
+      `与 ${path}.approaching_bonus 相同的数字`,
+    );
+  }
+  if (!sameNumber(queueBreakdown.decay_penalty, decayPenalty)) {
+    return fail(
+      `${path}.queue_score_breakdown.decay_penalty`,
+      `与 ${path}.decay_penalty 相同的数字`,
+    );
+  }
+  if (!sameNumber(queueBreakdown.queue_score, queueScore)) {
+    return fail(
+      `${path}.queue_score_breakdown.queue_score`,
+      `与 ${path}.queue_score 相同的数字`,
+    );
+  }
+  if (!sameNumber(score, queueScore)) {
+    return fail(`${path}.score`, `与 ${path}.queue_score 相同的兼容别名`);
+  }
+  const expectedQueueScore = Number(
+    Math.max(0, Math.min(120, importanceScore + approachingBonus - decayPenalty)).toFixed(2),
+  );
+  if (!sameNumber(queueScore, expectedQueueScore)) {
+    return fail(
+      `${path}.queue_score`,
+      `importance_score + approaching_bonus - decay_penalty 的结果 ${expectedQueueScore}`,
+    );
+  }
   return {
     id: expectString(row.id, `${path}.id`),
     key: expectString(row.key, `${path}.key`),
     title: expectString(row.title, `${path}.title`),
     reason: expectString(row.reason, `${path}.reason`),
-    status: expectString(row.status, `${path}.status`),
+    status,
     progress: expectString(row.progress, `${path}.progress`),
-    score: expectNumber(row.score, `${path}.score`),
+    score,
+    queue_rank: expectIntegerInRange(row.queue_rank, `${path}.queue_rank`, 1),
+    candidate_source: candidateSource,
+    attention_status: attentionStatus,
+    importance_score: importanceScore,
+    approaching_bonus: approachingBonus,
+    decay_penalty: decayPenalty,
+    queue_score: queueScore,
+    queue_score_breakdown: queueBreakdown,
     supporting_memory_ids: expectStringArray(
       row.supporting_memory_ids,
       `${path}.supporting_memory_ids`,
@@ -551,6 +816,9 @@ function parseTopic(value: unknown, path: string): Topic {
     score_breakdown: parseTopicScoreBreakdown(row.score_breakdown, `${path}.score_breakdown`),
     first_seen_at: expectNullableString(row.first_seen_at, `${path}.first_seen_at`),
     last_evidence_at: expectNullableString(row.last_evidence_at, `${path}.last_evidence_at`),
+    core_entered_at: expectNullableString(row.core_entered_at, `${path}.core_entered_at`),
+    demoted_at: expectNullableString(row.demoted_at, `${path}.demoted_at`),
+    calculated_at: expectNullableString(row.calculated_at, `${path}.calculated_at`),
     version: expectNullableNumber(row.version, `${path}.version`),
     updated_at: expectNullableString(row.updated_at, `${path}.updated_at`),
     versions: expectArray(row.versions, `${path}.versions`).map((item, index) =>
@@ -595,6 +863,30 @@ function parseTopicTracePolicy(value: unknown, path: string): TopicTracePolicy {
     memory_formula: expectString(row.memory_formula, `${path}.memory_formula`),
     topic_formula: expectString(row.topic_formula, `${path}.topic_formula`),
     rank_formula: expectString(row.rank_formula, `${path}.rank_formula`),
+    queue_policy_version: expectIntegerInRange(
+      row.queue_policy_version,
+      `${path}.queue_policy_version`,
+      1,
+    ),
+    core_limit: expectIntegerInRange(row.core_limit, `${path}.core_limit`, 1),
+    visible_candidate_limit: expectIntegerInRange(
+      row.visible_candidate_limit,
+      `${path}.visible_candidate_limit`,
+      1,
+    ),
+    scheduled_promotion_margin: expectNumberInRange(
+      row.scheduled_promotion_margin,
+      `${path}.scheduled_promotion_margin`,
+      0,
+      120,
+    ),
+    immediate_promotion_margin: expectNumberInRange(
+      row.immediate_promotion_margin,
+      `${path}.immediate_promotion_margin`,
+      0,
+      120,
+    ),
+    queue_formula: expectString(row.queue_formula, `${path}.queue_formula`),
     rubric: expectArray(row.rubric, `${path}.rubric`).map((item, index) =>
       parseTopicTraceRubric(item, `${path}.rubric[${index}]`),
     ),
@@ -617,13 +909,58 @@ function parseTopicTraceGrouping(value: unknown, path: string): TopicTraceGroupi
 
 function parseTopicTraceDecision(value: unknown, path: string): TopicTraceDecision {
   const row = expectObject(value, path);
+  const seatStatus = expectLiteral(
+    row.seat_status,
+    ["active", "suppressed"] as const,
+    `${path}.seat_status`,
+  );
+  const candidateSource = parseTopicCandidateSource(
+    row.candidate_source,
+    `${path}.candidate_source`,
+  );
+  const attentionStatus = expectLiteral(
+    row.attention_status,
+    ["open", "past_unconfirmed"] as const,
+    `${path}.attention_status`,
+  );
+  if (seatStatus === "active" && candidateSource !== null) {
+    return fail(`${path}.candidate_source`, "核心 Topic 使用 null");
+  }
+  if (seatStatus === "suppressed" && candidateSource === null) {
+    return fail(`${path}.candidate_source`, "候选 Topic 的 new、demoted 或 refreshed");
+  }
+  if (attentionStatus === "past_unconfirmed" && seatStatus !== "suppressed") {
+    return fail(`${path}.attention_status`, "仅与 suppressed 同时出现的 past_unconfirmed");
+  }
   return {
     qualifies: expectBoolean(row.qualifies, `${path}.qualifies`),
     base_score: expectNumber(row.base_score, `${path}.base_score`),
     recency_factor: expectNumber(row.recency_factor, `${path}.recency_factor`),
     rank_score: expectNumber(row.rank_score, `${path}.rank_score`),
     rank_position: expectNumber(row.rank_position, `${path}.rank_position`),
-    seat_status: expectString(row.seat_status, `${path}.seat_status`),
+    seat_status: seatStatus,
+    importance_score: expectNumberInRange(
+      row.importance_score,
+      `${path}.importance_score`,
+      0,
+      100,
+    ),
+    approaching_bonus: expectNumberInRange(
+      row.approaching_bonus,
+      `${path}.approaching_bonus`,
+      0,
+      20,
+    ),
+    decay_penalty: expectNumberInRange(
+      row.decay_penalty,
+      `${path}.decay_penalty`,
+      0,
+      20,
+    ),
+    queue_score: expectNumberInRange(row.queue_score, `${path}.queue_score`, 0, 120),
+    queue_rank: expectIntegerInRange(row.queue_rank, `${path}.queue_rank`, 1),
+    candidate_source: candidateSource,
+    attention_status: attentionStatus,
     candidate_reasons: expectStringArray(
       row.candidate_reasons,
       `${path}.candidate_reasons`,
@@ -734,6 +1071,23 @@ export function parseHealthResult(value: unknown): HealthResult {
 export function parseDashboard(value: unknown): Dashboard {
   const row = expectObject(value, "response");
   const counts = expectObject(row.counts, "response.counts");
+  const topics = expectArray(row.topics, "response.topics").map((item, index) =>
+    parseTopic(item, `response.topics[${index}]`),
+  );
+  if (topics.length > 3) {
+    return fail("response.topics", "最多 3 条核心 Topic");
+  }
+  topics.forEach((topic, index) => {
+    if (topic.status !== "active") {
+      return fail(`response.topics[${index}].status`, "active");
+    }
+    if (topic.queue_rank !== index + 1) {
+      return fail(
+        `response.topics[${index}].queue_rank`,
+        `从 1 开始连续编号的核心排名，当前应为 ${index + 1}`,
+      );
+    }
+  });
   return {
     backend_status: expectLiteral(
       row.backend_status,
@@ -752,9 +1106,7 @@ export function parseDashboard(value: unknown): Dashboard {
       queue_waiting: expectNumber(counts.queue_waiting, "response.counts.queue_waiting"),
       active_topics: expectNumber(counts.active_topics, "response.counts.active_topics"),
     },
-    topics: expectArray(row.topics, "response.topics").map((item, index) =>
-      parseTopic(item, `response.topics[${index}]`),
-    ),
+    topics,
     memories: expectArray(row.memories, "response.memories").map((item, index) =>
       parseMemorySummary(item, `response.memories[${index}]`),
     ),
@@ -796,11 +1148,113 @@ export function parseDeleteMemoryResult(value: unknown): DeleteMemoryResult {
 
 export function parseTopicList(value: unknown): TopicList {
   const row = expectObject(value, "response");
+  const items = expectArray(row.items, "response.items").map((item, index) =>
+    parseTopic(item, `response.items[${index}]`),
+  );
+  const total = expectIntegerInRange(row.total, "response.total", 0);
+  const returned = expectIntegerInRange(row.returned, "response.returned", 0);
+  const poolTotal = expectIntegerInRange(row.pool_total, "response.pool_total", 0);
+  const candidatePoolTotal = expectIntegerInRange(
+    row.candidate_pool_total,
+    "response.candidate_pool_total",
+    0,
+  );
+  const coreLimit = expectIntegerInRange(row.core_limit, "response.core_limit", 1);
+  const visibleCandidateLimit = expectIntegerInRange(
+    row.visible_candidate_limit,
+    "response.visible_candidate_limit",
+    1,
+  );
+  const coreCount = expectIntegerInRange(row.core_count, "response.core_count", 0);
+  const visibleCandidateCount = expectIntegerInRange(
+    row.visible_candidate_count,
+    "response.visible_candidate_count",
+    0,
+  );
+  const hiddenCandidateCount = expectIntegerInRange(
+    row.hidden_candidate_count,
+    "response.hidden_candidate_count",
+    0,
+  );
+
+  if (coreLimit !== 3) {
+    return fail("response.core_limit", "固定值 3");
+  }
+  if (visibleCandidateLimit !== 27) {
+    return fail("response.visible_candidate_limit", "固定值 27");
+  }
+  if (total !== items.length || returned !== items.length || total !== returned) {
+    return fail("response.total/returned", "与 items.length 相同的整数");
+  }
+
+  const core = items.filter((item) => item.status === "active");
+  const candidates = items.filter((item) => item.status === "suppressed");
+  if (core.length !== coreCount || coreCount > coreLimit) {
+    return fail("response.core_count", `0 到 ${coreLimit} 且与 active items 数量相同的整数`);
+  }
+  if (
+    candidates.length !== visibleCandidateCount ||
+    visibleCandidateCount > visibleCandidateLimit
+  ) {
+    return fail(
+      "response.visible_candidate_count",
+      `0 到 ${visibleCandidateLimit} 且与 suppressed items 数量相同的整数`,
+    );
+  }
+  if (candidatePoolTotal < visibleCandidateCount) {
+    return fail(
+      "response.candidate_pool_total",
+      "大于或等于 visible_candidate_count 的整数",
+    );
+  }
+  if (poolTotal < items.length) {
+    return fail("response.pool_total", "大于或等于返回 items 数量的整数");
+  }
+  if (poolTotal !== coreCount + candidatePoolTotal) {
+    return fail("response.pool_total", "core_count 与 candidate_pool_total 之和");
+  }
+  const expectedHidden = candidatePoolTotal - Math.min(candidatePoolTotal, visibleCandidateLimit);
+  if (hiddenCandidateCount !== expectedHidden) {
+    return fail(
+      "response.hidden_candidate_count",
+      "candidate_pool_total 超出 visible_candidate_limit 的数量",
+    );
+  }
+
+  let candidateSectionStarted = false;
+  for (const item of items) {
+    if (item.status === "suppressed") {
+      candidateSectionStarted = true;
+    } else if (candidateSectionStarted) {
+      return fail("response.items", "核心 Topic 在前、候选 Topic 在后的顺序");
+    }
+  }
+  for (const [lane, laneItems] of [
+    ["active", core],
+    ["suppressed", candidates],
+  ] as const) {
+    laneItems.forEach((item, index) => {
+      if (item.queue_rank !== index + 1) {
+        return fail(
+          `response.items(${lane}).queue_rank`,
+          `从 1 开始连续编号的队列排名，当前应为 ${index + 1}`,
+        );
+      }
+    });
+  }
+
   return {
-    total: expectNumber(row.total, "response.total"),
-    items: expectArray(row.items, "response.items").map((item, index) =>
-      parseTopic(item, `response.items[${index}]`),
-    ),
+    total,
+    returned,
+    pool_total: poolTotal,
+    candidate_pool_total: candidatePoolTotal,
+    core_limit: coreLimit,
+    visible_candidate_limit: visibleCandidateLimit,
+    core_count: coreCount,
+    visible_candidate_count: visibleCandidateCount,
+    hidden_candidate_count: hiddenCandidateCount,
+    calculated_at: expectNullableString(row.calculated_at, "response.calculated_at"),
+    items,
   };
 }
 

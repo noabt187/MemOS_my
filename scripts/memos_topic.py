@@ -22,9 +22,32 @@ import urllib.request
 import uuid
 
 from dataclasses import asdict, dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from zoneinfo import ZoneInfo
+
+from memos_topic_queue import (
+    DEFAULT_TOPIC_QUEUE_POLICY,
+    TOPIC_QUEUE_POLICY_VERSION,
+    TopicEventWindow,
+    TopicQueuePolicy,
+    TopicTimeEvidence,
+    calculate_approaching_bonus,
+    calculate_core_stagnation_penalty,
+    calculate_demoted_candidate_penalty,
+    calculate_queue_score,
+    latest_scheduled_slot,
+    next_scheduled_slot,
+    resolve_topic_event_window,
+)
+from memos_topic_queue import (
+    TOPIC_SCORE_THRESHOLD as QUEUE_TOPIC_SCORE_THRESHOLD,
+)
+
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 
 TAG_PROMPT = """你是个人记忆关注价值与主题候选分析器。
@@ -261,6 +284,17 @@ class BackfillResult:
     processed_memories: int
 
 
+@dataclass(frozen=True)
+class QueueRebalanceResult:
+    core_topic_ids: list[str]
+    visible_candidate_topic_ids: list[str]
+    hidden_candidate_count: int
+    promoted_topic_ids: list[str]
+    demoted_topic_ids: list[str]
+    retired_topic_ids: list[str]
+    calculated_at: str
+
+
 def extract_added_memories(response: Any) -> list[dict[str, Any]]:
     """Return every concrete memory produced by one synchronous MemOS add call."""
     if not isinstance(response, dict) or response.get("code", 200) != 200:
@@ -287,6 +321,7 @@ INITIATIVE_WEIGHTS = {
 STATUS_WEIGHTS = {
     "ongoing": 1.0,
     "planned": 0.7,
+    "due_unverified": 0.7,
     "uncertain": 0.3,
     "completed": 0.2,
     "cancelled": 0.0,
@@ -323,7 +358,6 @@ CONFIDENCE_FACTORS = {"low": 0.5, "medium": 0.8, "high": 1.0}
 TOPIC_SCORE_THRESHOLD = 60.0
 TOPIC_SUPPORTING_WEIGHT = 0.5
 TOPIC_SELECTION_VERSION = 3
-TOPIC_SCORE_REFRESH_SECONDS = 15 * 60
 
 _TRACE_DIMENSION_SPECS = (
     ("agency", "主动程度", "agency_points", AGENCY_POINTS, "model"),
@@ -466,25 +500,36 @@ def compute_candidate_metrics(
     )
 
     count = len(counted)
-    repeated_evidence = count >= 2 and relationship_vote_sum >= 1.5
+    open_evidence = [
+        item for item in counted if item.event_status not in {"completed", "cancelled"}
+    ]
+    open_relationship_vote_sum = round(
+        sum(RELATIONSHIP_WEIGHTS.get(item.relationship, 0.0) for item in open_evidence),
+        2,
+    )
+    repeated_evidence = len(open_evidence) >= 2 and open_relationship_vote_sum >= 1.5
     active_initiative = any(
         item.initiative_type in {"initiated", "committed"}
-        and item.event_status in {"planned", "ongoing"}
+        and item.event_status in {"planned", "ongoing", "due_unverified"}
         for item in counted
     )
     near_deadline = urgency_weight >= 0.6
     candidate_reasons = []
     if repeated_evidence:
-        candidate_reasons.append(f"有 {count} 个独立事件单元直接或明确支持该主题")
+        candidate_reasons.append(f"有 {len(open_evidence)} 个未闭环事件单元直接或明确支持该主题")
     if active_initiative:
         candidate_reasons.append("用户主动发起了计划中或进行中的事件")
     if near_deadline:
         candidate_reasons.append("存在七天内、已经到期或逾期的事件时间")
     qualifies = repeated_evidence or active_initiative or near_deadline
-    dominant_status = max(
-        (item.event_status for item in counted),
-        key=lambda value: STATUS_WEIGHTS.get(value, 0.3),
-        default="uncertain",
+    status_observations = [
+        (_parse_datetime(item.observed_at), item.event_status) for item in counted
+    ]
+    dated_statuses = [item for item in status_observations if item[0] is not None]
+    dominant_status = (
+        max(dated_statuses, key=lambda item: item[0])[1]
+        if dated_statuses
+        else status_observations[-1][1]
     )
     return CandidateMetrics(
         evidence_count=count,
@@ -723,6 +768,316 @@ def _unavailable_topic_trace(topic: dict[str, Any], reason: str) -> dict[str, An
     }
 
 
+def _legacy_topic_importance(topic: dict[str, Any]) -> float:
+    breakdown = topic.get("score_breakdown")
+    breakdown = breakdown if isinstance(breakdown, dict) else {}
+    if breakdown.get("model") == "static_importance_v3":
+        raw = breakdown.get("importance_score", breakdown.get("base_score", 0.0))
+    elif "importance_score" in topic:
+        raw = topic.get("importance_score")
+    else:
+        base = float(breakdown.get("base_score", topic.get("rank_score", 0.0)) or 0.0)
+        urgency = float(breakdown.get("urgency_points", 0.0) or 0.0)
+        raw = max(0.0, base - urgency)
+    try:
+        return round(max(0.0, min(100.0, float(raw))), 2)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _set_topic_queue_score(
+    topic: dict[str, Any],
+    *,
+    importance_score: float,
+    approaching_bonus: float,
+    decay_penalty: float,
+) -> None:
+    score = calculate_queue_score(importance_score, approaching_bonus, decay_penalty)
+    topic["importance_score"] = score.importance_score
+    topic["approaching_bonus"] = score.approaching_bonus
+    topic["decay_penalty"] = score.decay_penalty
+    topic["queue_score"] = score.queue_score
+    topic["rank_score"] = score.queue_score
+    topic["queue_score_breakdown"] = asdict(score)
+
+
+def _ensure_topic_queue_fields(topic: dict[str, Any]) -> None:
+    migration_pending = "queue_policy_version" not in topic
+    score_breakdown = topic.get("score_breakdown")
+    if (
+        "selection_version" not in topic
+        and isinstance(score_breakdown, dict)
+        and score_breakdown.get("model") == "static_importance_v3"
+    ):
+        # Early v3 queue snapshots already used the current score model but did
+        # not persist the explicit version field. This marker is enough to
+        # migrate those snapshots without admitting genuine v2 Topics.
+        topic["selection_version"] = TOPIC_SELECTION_VERSION
+    importance = _legacy_topic_importance(topic)
+    topic["queue_policy_version"] = TOPIC_QUEUE_POLICY_VERSION
+    topic["qualifies"] = bool(topic.get("qualifies", importance >= QUEUE_TOPIC_SCORE_THRESHOLD))
+    topic.setdefault(
+        "candidate_source", None if topic.get("lifecycle_status") == "active" else "new"
+    )
+    topic.setdefault("attention_status", "open")
+    topic.setdefault("core_entered_at", None)
+    topic.setdefault("demoted_at", None)
+    topic.setdefault("penalty_at_demotion", 0.0)
+    topic.setdefault("last_evidence_revision", None)
+    topic.setdefault("calculated_at", None)
+    topic.setdefault("queue_rank", None)
+    topic.setdefault("retired_reason", None)
+    topic.setdefault("last_queue_error", None)
+    topic.setdefault("last_queue_error_at", None)
+    if migration_pending:
+        topic["queue_migration_pending"] = True
+    _set_topic_queue_score(
+        topic,
+        importance_score=importance,
+        approaching_bonus=float(topic.get("approaching_bonus", 0.0) or 0.0),
+        decay_penalty=float(topic.get("decay_penalty", 0.0) or 0.0),
+    )
+    if topic.get("lifecycle_status") == "retired":
+        topic["approaching_bonus"] = 0.0
+        topic["decay_penalty"] = 0.0
+        topic["queue_score"] = 0.0
+        topic["rank_score"] = 0.0
+        topic["queue_score_breakdown"].update(
+            {"approaching_bonus": 0.0, "decay_penalty": 0.0, "queue_score": 0.0}
+        )
+
+
+def _promote_topic(topic: dict[str, Any], *, now: datetime) -> dict[str, Any]:
+    if topic.get("lifecycle_status") != "active":
+        topic["core_entered_at"] = now.isoformat()
+    topic["lifecycle_status"] = "active"
+    topic["candidate_source"] = None
+    topic["attention_status"] = "open"
+    topic["retired_reason"] = None
+    return topic
+
+
+def _demote_topic(
+    topic: dict[str, Any],
+    *,
+    now: datetime,
+    attention_status: str = "open",
+) -> dict[str, Any]:
+    was_core = topic.get("lifecycle_status") == "active"
+    topic["lifecycle_status"] = "suppressed"
+    if was_core:
+        topic["candidate_source"] = "demoted"
+        topic["demoted_at"] = now.isoformat()
+        topic["penalty_at_demotion"] = float(topic.get("decay_penalty", 0.0) or 0.0)
+        topic["core_entered_at"] = None
+    elif topic.get("candidate_source") not in {"new", "refreshed", "demoted"}:
+        topic["candidate_source"] = "new"
+    topic["attention_status"] = attention_status
+    return topic
+
+
+def _refresh_topic_evidence(
+    topic: dict[str, Any],
+    *,
+    previous_last_evidence_at: str | None,
+    new_last_evidence_at: str | None,
+    queue_evidence_revision_changed: bool,
+    now: datetime,
+) -> dict[str, Any]:
+    del now
+    previous = _parse_datetime(previous_last_evidence_at)
+    new = _parse_datetime(new_last_evidence_at)
+    newer_record = new is not None and (previous is None or new > previous)
+    if not queue_evidence_revision_changed and not newer_record:
+        return topic
+    topic["decay_penalty"] = 0.0
+    topic["penalty_at_demotion"] = 0.0
+    topic["demoted_at"] = None
+    topic["attention_status"] = "open"
+    if topic.get("lifecycle_status") == "suppressed":
+        topic["candidate_source"] = "refreshed"
+    return topic
+
+
+def _retire_topic_from_queue(
+    topic: dict[str, Any],
+    *,
+    reason: str,
+    now: datetime,
+) -> dict[str, Any]:
+    topic["lifecycle_status"] = "retired"
+    topic["candidate_source"] = None
+    topic["queue_rank"] = None
+    topic["retired_reason"] = reason
+    topic["calculated_at"] = now.isoformat()
+    _set_topic_queue_score(
+        topic,
+        importance_score=float(topic.get("importance_score", 0.0) or 0.0),
+        approaching_bonus=0.0,
+        decay_penalty=0.0,
+    )
+    topic["queue_score"] = 0.0
+    topic["rank_score"] = 0.0
+    topic["queue_score_breakdown"]["queue_score"] = 0.0
+    return topic
+
+
+def _memory_queue_evidence_revision(memory: dict[str, Any]) -> str:
+    info = _memory_info(memory)
+    payload = {
+        key: info.get(key)
+        for key in (
+            "event_status",
+            "event_time",
+            "event_start_time",
+            "event_end_time",
+            "event_start_at",
+            "event_end_at",
+            "source_recorded_at",
+        )
+    }
+    serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _topic_queue_evidence_revision(
+    scope: dict[str, Any],
+    memory_ids: list[str],
+) -> str:
+    values = []
+    for memory_id in sorted(set(memory_ids)):
+        record = scope.get("memories", {}).get(memory_id)
+        if not isinstance(record, dict):
+            continue
+        revision = record.get("queue_evidence_revision")
+        if not revision and isinstance(record.get("memory"), dict):
+            revision = _memory_queue_evidence_revision(record["memory"])
+        values.append([memory_id, revision])
+    serialized = json.dumps(values, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _topic_time_evidence(scope: dict[str, Any], topic: dict[str, Any]) -> list[TopicTimeEvidence]:
+    result = []
+    for memory_id in topic.get("supporting_memory_ids", []):
+        record = scope.get("memories", {}).get(str(memory_id))
+        memory = record.get("memory") if isinstance(record, dict) else None
+        if not isinstance(memory, dict):
+            continue
+        metadata = memory.get("metadata") if isinstance(memory.get("metadata"), dict) else {}
+        info = _memory_info(memory)
+        result.append(
+            TopicTimeEvidence(
+                memory_id=str(memory_id),
+                source_recorded_at=(
+                    str(info["source_recorded_at"]) if info.get("source_recorded_at") else None
+                ),
+                created_at=(
+                    str(metadata["created_at"])
+                    if metadata.get("created_at")
+                    else str(memory["created_at"])
+                    if memory.get("created_at")
+                    else None
+                ),
+                event_start_time=(
+                    str(info["event_start_time"]) if info.get("event_start_time") else None
+                ),
+                event_start_at=(
+                    str(info["event_start_at"]) if info.get("event_start_at") else None
+                ),
+                event_time=str(info["event_time"]) if info.get("event_time") else None,
+                event_end_time=(
+                    str(info["event_end_time"]) if info.get("event_end_time") else None
+                ),
+                event_end_at=str(info["event_end_at"]) if info.get("event_end_at") else None,
+            )
+        )
+    return result
+
+
+def _topic_event_window(scope: dict[str, Any], topic: dict[str, Any]) -> TopicEventWindow:
+    return resolve_topic_event_window(_topic_time_evidence(scope, topic))
+
+
+def _window_local_date(value: str | None, timezone_name: str) -> date | None:
+    if not value:
+        return None
+    try:
+        if len(value) == 10:
+            return date.fromisoformat(value)
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    zone = ZoneInfo(timezone_name)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=zone)
+    return parsed.astimezone(zone).date()
+
+
+def _topic_event_is_past(
+    window: TopicEventWindow,
+    now: datetime,
+    timezone_name: str,
+) -> bool:
+    if window.conflict or window.precision not in {"day", "datetime", "hour", "minute"}:
+        return False
+    zone = ZoneInfo(timezone_name)
+    reference_now = now.replace(tzinfo=zone) if now.tzinfo is None else now.astimezone(zone)
+    end_date = _window_local_date(window.end_at or window.start_at, timezone_name)
+    return end_date is not None and reference_now.date() > end_date
+
+
+def _topic_event_sort_value(window: TopicEventWindow, timezone_name: str) -> tuple[int, float]:
+    value = window.start_at or window.end_at
+    if not value or window.conflict:
+        return (1, float("inf"))
+    try:
+        if len(value) == 10:
+            parsed = datetime.combine(
+                date.fromisoformat(value),
+                datetime.min.time(),
+                tzinfo=ZoneInfo(timezone_name),
+            )
+        else:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=ZoneInfo(timezone_name))
+        return (0, parsed.timestamp())
+    except ValueError:
+        return (1, float("inf"))
+
+
+def _topic_is_actionable_overdue(scope: dict[str, Any], topic: dict[str, Any]) -> bool:
+    progress_status = str(topic.get("progress_status") or "").lower()
+    if progress_status == "due_unverified":
+        return True
+    if progress_status != "ongoing":
+        return False
+    actionable = {"ongoing", "clear_next_action", "must_do"}
+    return any(
+        isinstance(scope.get("assessments", {}).get(str(memory_id)), dict)
+        and scope["assessments"][str(memory_id)].get("action_requirement") in actionable
+        for memory_id in topic.get("supporting_memory_ids", [])
+    )
+
+
+def _queue_topic_sort_key(
+    topic: dict[str, Any],
+    *,
+    window: TopicEventWindow,
+    timezone_name: str,
+) -> tuple[Any, ...]:
+    event_unknown, event_value = _topic_event_sort_value(window, timezone_name)
+    return (
+        -float(topic.get("queue_score", 0.0) or 0.0),
+        -float(topic.get("importance_score", 0.0) or 0.0),
+        event_unknown,
+        event_value,
+        -_datetime_sort_value(topic.get("last_evidence_at")),
+        str(topic.get("topic_id", "")),
+    )
+
+
 class TopicStore:
     """Small JSON snapshot for rolling Topics; MemOS remains the memory database."""
 
@@ -730,8 +1085,13 @@ class TopicStore:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = _shared_topic_store_lock(self.path)
+        # Existing snapshots are opened by every frontend request. Do not wait
+        # for a long model-backed writer transaction just to confirm that the
+        # already-created file exists.
         if not self.path.exists():
-            self._write(self._empty_state())
+            with self._lock:
+                if not self.path.exists():
+                    self._write_unlocked(self._empty_state())
 
     def transaction(self) -> Any:
         """Serialize one complete Topic update across store instances in this process."""
@@ -745,37 +1105,60 @@ class TopicStore:
     def _scope_key(user_id: str, cube_id: str) -> str:
         return json.dumps([user_id, cube_id], ensure_ascii=False, separators=(",", ":"))
 
+    def _read_unlocked(self) -> dict[str, Any]:
+        if not self.path.exists():
+            return self._empty_state()
+        try:
+            state = json.loads(self.path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ValueError(
+                f"Topic 状态文件不是有效 JSON：{self.path}。旧 SQLite 文件不会自动覆盖。"
+            ) from exc
+        if not isinstance(state, dict) or state.get("schema_version") != 1:
+            raise ValueError(f"不支持的 Topic 状态文件：{self.path}")
+        state.setdefault("scopes", {})
+        state.setdefault("last_scheduled_slot", None)
+        for scope in state["scopes"].values():
+            if isinstance(scope, dict):
+                scope.setdefault("memories", {})
+                scope.setdefault("tags", {})
+                scope.setdefault("assessments", {})
+                scope.setdefault("group_cache", {})
+                scope.setdefault("topics", {})
+                scope.setdefault("queue_calculated_at", None)
+                for topic in scope["topics"].values():
+                    if isinstance(topic, dict):
+                        _ensure_topic_queue_fields(topic)
+        return state
+
     def _read(self) -> dict[str, Any]:
         with self._lock:
-            if not self.path.exists():
-                return self._empty_state()
-            try:
-                state = json.loads(self.path.read_text(encoding="utf-8"))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise ValueError(
-                    f"Topic 状态文件不是有效 JSON：{self.path}。旧 SQLite 文件不会自动覆盖。"
-                ) from exc
-            if not isinstance(state, dict) or state.get("schema_version") != 1:
-                raise ValueError(f"不支持的 Topic 状态文件：{self.path}")
-            state.setdefault("scopes", {})
-            for scope in state["scopes"].values():
-                if isinstance(scope, dict):
-                    scope.setdefault("memories", {})
-                    scope.setdefault("tags", {})
-                    scope.setdefault("assessments", {})
-                    scope.setdefault("group_cache", {})
-                    scope.setdefault("topics", {})
-            return state
+            return self._read_unlocked()
+
+    def _read_snapshot(self) -> dict[str, Any]:
+        """Read the last atomic snapshot without waiting for an in-flight writer."""
+        return self._read_unlocked()
+
+    def _write_unlocked(self, state: dict[str, Any]) -> None:
+        state["updated_at"] = _now_iso()
+        temporary = self.path.with_name(f".{self.path.name}.tmp")
+        temporary.write_text(
+            json.dumps(state, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temporary, self.path)
 
     def _write(self, state: dict[str, Any]) -> None:
         with self._lock:
-            state["updated_at"] = _now_iso()
-            temporary = self.path.with_name(f".{self.path.name}.tmp")
-            temporary.write_text(
-                json.dumps(state, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
-            os.replace(temporary, self.path)
+            self._write_unlocked(state)
+
+    def mutate_queue_state(self, callback: Callable[[dict[str, Any]], Any]) -> Any:
+        """Apply one complete queue mutation with one read and one atomic write."""
+        with self._lock:
+            state = self._read_unlocked()
+            result = callback(state)
+            self._write_unlocked(state)
+            return result
 
     def _scope(
         self,
@@ -797,6 +1180,7 @@ class TopicStore:
                 "assessments": {},
                 "group_cache": {},
                 "topics": {},
+                "queue_calculated_at": None,
             }
             scopes[key] = scope
         return scope
@@ -832,6 +1216,7 @@ class TopicStore:
             "active": True,
             "processed_at": _now_iso(),
             "revision": _memory_revision(memory),
+            "queue_evidence_revision": _memory_queue_evidence_revision(memory),
         }
         self._write(state)
 
@@ -898,33 +1283,263 @@ class TopicStore:
         user_id: str,
         cube_id: str,
     ) -> tuple[list[dict[str, Any]], dict[str, MemoryAssessment], dict[str, list[TagEvidence]]]:
-        state = self._read()
-        scope = self._scope(state, user_id, cube_id)
-        if scope is None:
-            return [], {}, {}
-        memories = []
-        assessments = {}
-        tags_by_memory = {}
-        for memory_id, record in scope["memories"].items():
-            if not record.get("active", False):
-                continue
-            assessment_raw = scope["assessments"].get(memory_id)
-            if not isinstance(assessment_raw, dict):
-                continue
-            try:
-                assessment = MemoryAssessment(**assessment_raw)
-            except TypeError as exc:
-                raise ValueError(f"记忆 {memory_id} 的 Topic assessment 状态无效") from exc
-            if assessment.selection_version != TOPIC_SELECTION_VERSION:
-                raise ValueError(f"记忆 {memory_id} 的 Topic assessment 版本需要重新处理")
-            memories.append(record["memory"])
-            assessments[memory_id] = assessment
-            tags_by_memory[memory_id] = [
-                TagEvidence(**item)
-                for item in scope["tags"].get(memory_id, [])
-                if isinstance(item, dict)
-            ]
-        return memories, assessments, tags_by_memory
+        # Version migration must be read-and-written under one lock. Otherwise a
+        # concurrent import could be overwritten by the upgraded snapshot.
+        with self._lock:
+            state = self._read_unlocked()
+            scope = self._scope(state, user_id, cube_id)
+            if scope is None:
+                return [], {}, {}
+            memories = []
+            assessments = {}
+            tags_by_memory = {}
+            changed = False
+            for memory_id, record in scope["memories"].items():
+                if not record.get("active", False):
+                    continue
+                assessment_raw = scope["assessments"].get(memory_id)
+                if not isinstance(assessment_raw, dict):
+                    continue
+
+                # Inspect the raw JSON before constructing the dataclass. The
+                # dataclass default is the current version, so constructing it
+                # first would incorrectly treat an unversioned legacy record as
+                # already migrated.
+                raw_version = assessment_raw.get("selection_version")
+                if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+                    # There is no reliable schema information. Leave it pending
+                    # so the normal backfill path can analyse it again.
+                    continue
+                if raw_version > TOPIC_SELECTION_VERSION:
+                    raise ValueError(
+                        f"记忆 {memory_id} 的 Topic assessment 版本 {raw_version} "
+                        f"高于当前代码版本 {TOPIC_SELECTION_VERSION}，不能降级处理"
+                    )
+                if raw_version not in {2, TOPIC_SELECTION_VERSION}:
+                    # Only v2 has the same discrete judgement fields as v3 and
+                    # can therefore be upgraded without another model call.
+                    continue
+                try:
+                    assessment = MemoryAssessment(**assessment_raw)
+                    if raw_version == 2:
+                        assessment = _refresh_memory_assessment_score(
+                            record["memory"],
+                            assessment,
+                            datetime.now().astimezone(),
+                        )
+                        scope["assessments"][memory_id] = asdict(assessment)
+                        changed = True
+                except (KeyError, TypeError, ValueError) as exc:
+                    if raw_version == TOPIC_SELECTION_VERSION:
+                        raise ValueError(
+                            f"记忆 {memory_id} 的 Topic assessment 状态无效"
+                        ) from exc
+                    # A malformed v2 record cannot be upgraded deterministically.
+                    # Leave it pending for the ordinary model-backed backfill.
+                    continue
+                memories.append(record["memory"])
+                assessments[memory_id] = assessment
+                tags_by_memory[memory_id] = [
+                    TagEvidence(**item)
+                    for item in scope["tags"].get(memory_id, [])
+                    if isinstance(item, dict)
+                ]
+            if changed:
+                self._write_unlocked(state)
+            return memories, assessments, tags_by_memory
+
+    def upgrade_selection_versions(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        now: datetime | None = None,
+        policy: TopicQueuePolicy = DEFAULT_TOPIC_QUEUE_POLICY,
+    ) -> dict[str, Any]:
+        """Upgrade compatible v2 assessments and Topics without MemOS or model calls."""
+        reference_now = now or datetime.now().astimezone()
+        with self._lock:
+            state = self._read_unlocked()
+            scope = self._scope(state, user_id, cube_id)
+            if scope is None:
+                return {
+                    "upgraded_assessments": 0,
+                    "pending_assessments": 0,
+                    "upgraded_topics": 0,
+                    "pending_topics": 0,
+                    "retired_topics": 0,
+                    "queue": None,
+                }
+
+            upgraded_assessments = 0
+            pending_assessments = 0
+            assessments: dict[str, MemoryAssessment] = {}
+            for memory_id, assessment_raw in scope["assessments"].items():
+                if not isinstance(assessment_raw, dict):
+                    pending_assessments += 1
+                    continue
+                raw_version = assessment_raw.get("selection_version")
+                if isinstance(raw_version, bool) or not isinstance(raw_version, int):
+                    pending_assessments += 1
+                    continue
+                if raw_version > TOPIC_SELECTION_VERSION:
+                    raise ValueError(
+                        f"记忆 {memory_id} 的 Topic assessment 版本 {raw_version} "
+                        f"高于当前代码版本 {TOPIC_SELECTION_VERSION}，不能降级处理"
+                    )
+                record = scope["memories"].get(memory_id)
+                memory = record.get("memory") if isinstance(record, dict) else None
+                try:
+                    assessment = MemoryAssessment(**assessment_raw)
+                    if raw_version == 2:
+                        if not isinstance(memory, dict):
+                            raise ValueError("缺少记忆快照")
+                        assessment = _refresh_memory_assessment_score(
+                            memory,
+                            assessment,
+                            reference_now,
+                        )
+                        scope["assessments"][memory_id] = asdict(assessment)
+                        upgraded_assessments += 1
+                    elif raw_version != TOPIC_SELECTION_VERSION:
+                        pending_assessments += 1
+                        continue
+                except (KeyError, TypeError, ValueError):
+                    pending_assessments += 1
+                    continue
+                assessments[memory_id] = assessment
+
+            upgraded_topics = 0
+            pending_topics = 0
+            retired_topics = 0
+            for topic in scope["topics"].values():
+                if not isinstance(topic, dict):
+                    continue
+                raw_version = topic.get("selection_version")
+                if (
+                    isinstance(raw_version, int)
+                    and not isinstance(raw_version, bool)
+                    and raw_version > TOPIC_SELECTION_VERSION
+                ):
+                    raise ValueError(
+                        f"Topic {topic.get('topic_id') or topic.get('topic_key')} 版本 "
+                        f"{raw_version} 高于当前代码版本 "
+                        f"{TOPIC_SELECTION_VERSION}，不能降级处理"
+                    )
+                if raw_version != 2:
+                    continue
+
+                supporting_ids = [
+                    str(memory_id).strip()
+                    for memory_id in topic.get("supporting_memory_ids", [])
+                    if str(memory_id).strip()
+                ]
+                topic_memories = []
+                topic_assessments = []
+                topic_tags: dict[str, list[TagEvidence]] = {}
+                unresolved_active_support = False
+                for memory_id in supporting_ids:
+                    record = scope["memories"].get(memory_id)
+                    memory = record.get("memory") if isinstance(record, dict) else None
+                    if not isinstance(memory, dict) or not record.get("active", False):
+                        continue
+                    if not _is_active_event_memory(memory):
+                        continue
+                    assessment = assessments.get(memory_id)
+                    if assessment is None:
+                        unresolved_active_support = True
+                        continue
+                    topic_memories.append(memory)
+                    topic_assessments.append(assessment)
+                    try:
+                        topic_tags[memory_id] = [
+                            TagEvidence(**item)
+                            for item in scope["tags"].get(memory_id, [])
+                            if isinstance(item, dict)
+                        ]
+                    except TypeError:
+                        unresolved_active_support = True
+                        break
+                if unresolved_active_support:
+                    pending_topics += 1
+                    continue
+
+                metrics = compute_topic_metrics(
+                    assessments=topic_assessments,
+                    memories=topic_memories,
+                    now=reference_now,
+                )
+                versions = list(topic.get("versions", []))
+                versions.append({key: value for key, value in topic.items() if key != "versions"})
+                topic["versions"] = versions[-20:]
+                topic["version"] = int(topic.get("version", 0) or 0) + 1
+                topic["selection_version"] = TOPIC_SELECTION_VERSION
+                topic["supporting_memory_ids"] = metrics.supporting_memory_ids
+                topic["candidate_reasons"] = metrics.candidate_reasons
+                topic["score_breakdown"] = metrics.score_breakdown
+                topic["progress_status"] = metrics.progress_status
+                topic["importance_score"] = metrics.importance_score
+                topic["qualifies"] = metrics.qualifies
+                topic["last_evidence_at"] = metrics.latest_evidence_at or topic.get(
+                    "last_evidence_at"
+                )
+                topic["updated_at"] = reference_now.isoformat()
+                if metrics.supporting_memory_ids:
+                    memory_by_id = {_memory_id(memory): memory for memory in topic_memories}
+                    topic["selection_fingerprint"] = _selection_fingerprint(
+                        metrics.supporting_memory_ids,
+                        memory_by_id,
+                        {item.memory_id: item for item in topic_assessments},
+                        topic_tags,
+                        topic_kind=str(topic.get("topic_kind") or "event"),
+                        grouping_reason=str(topic.get("grouping_reason") or ""),
+                        grouping_anchor=(
+                            str(topic["grouping_anchor"])
+                            if topic.get("grouping_anchor") is not None
+                            else None
+                        ),
+                    )
+                _ensure_topic_queue_fields(topic)
+                topic["last_evidence_revision"] = _topic_queue_evidence_revision(
+                    scope,
+                    metrics.supporting_memory_ids,
+                )
+                if not metrics.qualifies or topic.get("lifecycle_status") == "retired":
+                    _retire_topic_from_queue(
+                        topic,
+                        reason=(
+                            str(topic.get("retired_reason") or "selection_version_upgrade")
+                            if topic.get("lifecycle_status") == "retired"
+                            else "below_current_selection_threshold"
+                        ),
+                        now=reference_now,
+                    )
+                    retired_topics += 1
+                else:
+                    _set_topic_queue_score(
+                        topic,
+                        importance_score=metrics.importance_score,
+                        approaching_bonus=float(topic.get("approaching_bonus", 0.0) or 0.0),
+                        decay_penalty=float(topic.get("decay_penalty", 0.0) or 0.0),
+                    )
+                upgraded_topics += 1
+
+            queue_result = self._rebalance_scope(
+                scope,
+                now=reference_now,
+                mode="scheduled",
+                policy=policy,
+            )
+            scope["queue_calculated_at"] = queue_result.calculated_at
+            self._write_unlocked(state)
+            return {
+                "upgraded_assessments": upgraded_assessments,
+                "pending_assessments": pending_assessments,
+                "upgraded_topics": upgraded_topics,
+                "pending_topics": pending_topics,
+                "retired_topics": retired_topics,
+                "queue": asdict(queue_result),
+            }
 
     def current_topic_records(
         self,
@@ -960,7 +1575,7 @@ class TopicStore:
         cube_id: str,
         topic_key: str,
     ) -> dict[str, Any] | None:
-        state = self._read()
+        state = self._read_snapshot()
         scope = self._scope(state, user_id, cube_id)
         if scope is None or topic_key not in scope["topics"]:
             return None
@@ -975,7 +1590,7 @@ class TopicStore:
         seat_limit: int = 15,
     ) -> dict[str, Any] | None:
         """Project saved state without recalculation; current_score is the Topic snapshot score."""
-        state = self._read()
+        state = self._read_snapshot()
         scope = self._scope(state, user_id, cube_id)
         if scope is None:
             return None
@@ -1052,6 +1667,7 @@ class TopicStore:
                 for item in scope["topics"].values()
                 if isinstance(item, dict)
                 and item.get("lifecycle_status") in {"active", "suppressed"}
+                and item.get("selection_version") == TOPIC_SELECTION_VERSION
             ]
             ranked_topics.sort(
                 key=lambda item: (
@@ -1201,35 +1817,6 @@ class TopicStore:
         scope["last_rebuilt_at"] = _now_iso()
         self._write(state)
 
-    def scopes_due_for_score_refresh(
-        self,
-        *,
-        now: datetime,
-        interval_seconds: int = TOPIC_SCORE_REFRESH_SECONDS,
-    ) -> set[tuple[str, str]]:
-        state = self._read()
-        result: set[tuple[str, str]] = set()
-        for scope in state["scopes"].values():
-            has_active_assessment = any(
-                record.get("active", False) and memory_id in scope["assessments"]
-                for memory_id, record in scope["memories"].items()
-            )
-            if not has_active_assessment:
-                continue
-            last_rebuilt = _parse_datetime(str(scope.get("last_rebuilt_at") or ""))
-            if last_rebuilt is None:
-                result.add((str(scope["user_id"]), str(scope["cube_id"])))
-                continue
-            reference_now = now
-            if reference_now.tzinfo is None:
-                reference_now = reference_now.replace(tzinfo=timezone.utc)
-            elapsed = (
-                reference_now - last_rebuilt.astimezone(reference_now.tzinfo)
-            ).total_seconds()
-            if elapsed >= interval_seconds:
-                result.add((str(scope["user_id"]), str(scope["cube_id"])))
-        return result
-
     def tag_catalog(self, user_id: str, cube_id: str, limit: int = 100) -> list[dict[str, str]]:
         state = self._read()
         scope = self._scope(state, user_id, cube_id)
@@ -1277,12 +1864,41 @@ class TopicStore:
         if scope is None or topic_key not in scope["topics"]:
             return
         topic = scope["topics"][topic_key]
+        _ensure_topic_queue_fields(topic)
+        previous_last_evidence_at = topic.get("last_evidence_at")
+        previous_queue_revision = topic.get("last_evidence_revision")
+        previous_supporting_ids = {str(value) for value in topic.get("supporting_memory_ids", [])}
         topic["supporting_memory_ids"] = metrics.supporting_memory_ids
         topic["candidate_reasons"] = metrics.candidate_reasons
         topic["score_breakdown"] = metrics.score_breakdown
-        topic["rank_score"] = metrics.score_breakdown["rank_score"]
+        importance_score = float(
+            metrics.importance_score
+            or metrics.score_breakdown.get("importance_score")
+            or metrics.score_breakdown.get("base_score", 0.0)
+        )
+        topic["importance_score"] = importance_score
+        topic["qualifies"] = importance_score >= QUEUE_TOPIC_SCORE_THRESHOLD
         topic["progress_status"] = metrics.progress_status
         topic["last_evidence_at"] = metrics.latest_evidence_at or topic.get("last_evidence_at")
+        queue_revision = _topic_queue_evidence_revision(scope, metrics.supporting_memory_ids)
+        _refresh_topic_evidence(
+            topic,
+            previous_last_evidence_at=previous_last_evidence_at,
+            new_last_evidence_at=topic.get("last_evidence_at"),
+            queue_evidence_revision_changed=(
+                previous_queue_revision is not None
+                and previous_queue_revision != queue_revision
+                and previous_supporting_ids == set(metrics.supporting_memory_ids)
+            ),
+            now=datetime.now().astimezone(),
+        )
+        topic["last_evidence_revision"] = queue_revision
+        _set_topic_queue_score(
+            topic,
+            importance_score=importance_score,
+            approaching_bonus=float(topic.get("approaching_bonus", 0.0) or 0.0),
+            decay_penalty=float(topic.get("decay_penalty", 0.0) or 0.0),
+        )
         topic["selection_version"] = TOPIC_SELECTION_VERSION
         if topic_kind is not None:
             topic["topic_kind"] = topic_kind
@@ -1387,8 +2003,10 @@ class TopicStore:
         state = self._read()
         scope = self._scope(state, user_id, cube_id)
         if scope and topic_key in scope["topics"]:
-            scope["topics"][topic_key]["lifecycle_status"] = "retired"
-            scope["topics"][topic_key]["updated_at"] = _now_iso()
+            now = datetime.now().astimezone()
+            topic = scope["topics"][topic_key]
+            _retire_topic_from_queue(topic, reason="below_legacy_threshold", now=now)
+            topic["updated_at"] = now.isoformat()
             self._write(state)
 
     def retire_unmatched_topics(
@@ -1399,13 +2017,19 @@ class TopicStore:
         kept_topic_keys: set[str],
         include_legacy: bool = False,
     ) -> None:
-        """Retire current Topics that no longer have a qualifying memory group."""
+        """Hide low-scoring Topics; retire only missing or merged evidence."""
         state = self._read()
         scope = self._scope(state, user_id, cube_id)
         if scope is None:
             return
         changed = False
         now = _now_iso()
+        reference_now = datetime.fromisoformat(now)
+        kept_memory_ids = {
+            str(memory_id)
+            for kept_key in kept_topic_keys
+            for memory_id in scope["topics"].get(kept_key, {}).get("supporting_memory_ids", [])
+        }
         for topic_key, topic in scope["topics"].items():
             if topic_key in kept_topic_keys:
                 continue
@@ -1413,7 +2037,25 @@ class TopicStore:
                 continue
             if not include_legacy and topic.get("selection_version") != TOPIC_SELECTION_VERSION:
                 continue
-            topic["lifecycle_status"] = "retired"
+            supporting_ids = {str(value) for value in topic.get("supporting_memory_ids", [])}
+            active_support = {
+                memory_id
+                for memory_id in supporting_ids
+                if scope["memories"].get(memory_id, {}).get("active", False)
+            }
+            if not active_support:
+                _retire_topic_from_queue(
+                    topic, reason="supporting_memories_inactive", now=reference_now
+                )
+            elif supporting_ids and supporting_ids <= kept_memory_ids:
+                _retire_topic_from_queue(
+                    topic, reason="merged_into_another_topic", now=reference_now
+                )
+            else:
+                _demote_topic(topic, now=reference_now)
+                topic["qualifies"] = False
+                topic["queue_rank"] = None
+                topic["retired_reason"] = None
             topic["updated_at"] = now
             changed = True
         if changed:
@@ -1446,13 +2088,41 @@ class TopicStore:
         if existing:
             versions.append({key: value for key, value in existing.items() if key != "versions"})
             versions = versions[-20:]
-        effective_rank = (
+        effective_importance = (
             float(rank_score)
             if rank_score is not None
-            else float(metrics.score_breakdown.get("rank_score", 0.0))
+            else float(
+                metrics.importance_score
+                or metrics.score_breakdown.get("importance_score")
+                or metrics.score_breakdown.get("base_score", 0.0)
+            )
         )
         last_evidence_at = metrics.latest_evidence_at or now
-        scope["topics"][topic_key] = {
+        queue_state = (
+            {
+                key: existing.get(key)
+                for key in (
+                    "lifecycle_status",
+                    "candidate_source",
+                    "attention_status",
+                    "core_entered_at",
+                    "demoted_at",
+                    "penalty_at_demotion",
+                    "decay_penalty",
+                    "approaching_bonus",
+                    "queue_rank",
+                    "last_evidence_revision",
+                    "calculated_at",
+                    "retired_reason",
+                    "last_queue_error",
+                    "last_queue_error_at",
+                    "queue_migration_pending",
+                )
+            }
+            if existing
+            else {}
+        )
+        topic = {
             "topic_id": topic_id,
             "user_id": user_id,
             "cube_id": cube_id,
@@ -1463,7 +2133,6 @@ class TopicStore:
             "supporting_memory_ids": metrics.supporting_memory_ids,
             "candidate_reasons": metrics.candidate_reasons,
             "score_breakdown": metrics.score_breakdown,
-            "rank_score": effective_rank,
             "progress_status": metrics.progress_status,
             "topic_kind": topic_kind,
             "grouping_reason": grouping_reason,
@@ -1471,7 +2140,7 @@ class TopicStore:
             "candidate_tag_keys": list(candidate_tag_keys or []),
             "selection_version": TOPIC_SELECTION_VERSION,
             "selection_fingerprint": selection_fingerprint,
-            "lifecycle_status": "active",
+            "lifecycle_status": "suppressed",
             "topic_date": _topic_date(last_evidence_at),
             "first_seen_at": existing.get("first_seen_at", now) if existing else now,
             "last_evidence_at": last_evidence_at,
@@ -1479,8 +2148,499 @@ class TopicStore:
             "updated_at": now,
             "versions": versions,
         }
+        topic.update(queue_state)
+        topic["queue_policy_version"] = TOPIC_QUEUE_POLICY_VERSION
+        topic["importance_score"] = max(0.0, min(100.0, effective_importance))
+        topic["qualifies"] = topic["importance_score"] >= QUEUE_TOPIC_SCORE_THRESHOLD
+        if not existing:
+            topic["lifecycle_status"] = "suppressed"
+            topic["candidate_source"] = "new"
+            topic["attention_status"] = "open"
+            topic["core_entered_at"] = None
+            topic["demoted_at"] = None
+            topic["penalty_at_demotion"] = 0.0
+            topic["decay_penalty"] = 0.0
+            topic["approaching_bonus"] = 0.0
+            topic["queue_rank"] = None
+            topic["calculated_at"] = None
+            topic["retired_reason"] = None
+            topic["last_queue_error"] = None
+            topic["last_queue_error_at"] = None
+        previous_last_evidence_at = existing.get("last_evidence_at") if existing else None
+        previous_queue_revision = existing.get("last_evidence_revision") if existing else None
+        previous_supporting_ids = (
+            {str(value) for value in existing.get("supporting_memory_ids", [])}
+            if existing
+            else set()
+        )
+        queue_revision = _topic_queue_evidence_revision(scope, metrics.supporting_memory_ids)
+        if existing:
+            _refresh_topic_evidence(
+                topic,
+                previous_last_evidence_at=previous_last_evidence_at,
+                new_last_evidence_at=last_evidence_at,
+                queue_evidence_revision_changed=(
+                    previous_queue_revision is not None
+                    and previous_queue_revision != queue_revision
+                    and previous_supporting_ids == set(metrics.supporting_memory_ids)
+                ),
+                now=datetime.now().astimezone(),
+            )
+        topic["last_evidence_revision"] = queue_revision
+        _set_topic_queue_score(
+            topic,
+            importance_score=topic["importance_score"],
+            approaching_bonus=float(topic.get("approaching_bonus", 0.0) or 0.0),
+            decay_penalty=float(topic.get("decay_penalty", 0.0) or 0.0),
+        )
+        scope["topics"][topic_key] = topic
         self._write(state)
         return topic_id
+
+    @staticmethod
+    def _recalculate_queue_topic(
+        scope: dict[str, Any],
+        topic: dict[str, Any],
+        *,
+        now: datetime,
+        policy: TopicQueuePolicy,
+    ) -> TopicEventWindow:
+        _ensure_topic_queue_fields(topic)
+        window = _topic_event_window(scope, topic)
+        status = str(topic.get("progress_status") or "uncertain").lower()
+        if topic.get("lifecycle_status") == "retired":
+            _retire_topic_from_queue(
+                topic,
+                reason=str(topic.get("retired_reason") or "retired"),
+                now=now,
+            )
+            return window
+        if status in {"completed", "cancelled"}:
+            _retire_topic_from_queue(topic, reason=status, now=now)
+            return window
+
+        importance = float(topic.get("importance_score", 0.0) or 0.0)
+        topic["qualifies"] = importance >= QUEUE_TOPIC_SCORE_THRESHOLD
+        event_is_past = _topic_event_is_past(window, now, policy.timezone_name)
+        actionable_overdue = event_is_past and _topic_is_actionable_overdue(scope, topic)
+        if event_is_past and not actionable_overdue:
+            first_seen_at = _parse_datetime(topic.get("first_seen_at"))
+            event_end_date = _window_local_date(
+                window.end_at or window.start_at,
+                policy.timezone_name,
+            )
+            first_seen_date = (
+                first_seen_at.astimezone(ZoneInfo(policy.timezone_name)).date()
+                if first_seen_at is not None
+                else None
+            )
+            if (
+                topic.get("lifecycle_status") == "suppressed"
+                and topic.get("candidate_source") == "new"
+                and topic.get("attention_status") == "open"
+                and event_end_date is not None
+                and first_seen_date is not None
+                and first_seen_date > event_end_date
+            ):
+                _retire_topic_from_queue(
+                    topic,
+                    reason="historical_event_before_import",
+                    now=now,
+                )
+                return window
+            _demote_topic(topic, now=now, attention_status="past_unconfirmed")
+            approaching_bonus = 0.0
+        else:
+            approaching_bonus = calculate_approaching_bonus(
+                window,
+                now,
+                policy.timezone_name,
+            )
+
+        if topic.get("lifecycle_status") == "active":
+            decay_penalty = calculate_core_stagnation_penalty(
+                topic.get("core_entered_at"),
+                topic.get("last_evidence_at"),
+                float(topic.get("decay_penalty", 0.0) or 0.0),
+                now,
+            )
+        elif topic.get("candidate_source") == "demoted":
+            decay_penalty = calculate_demoted_candidate_penalty(
+                topic.get("demoted_at"),
+                float(topic.get("penalty_at_demotion", 0.0) or 0.0),
+                now,
+            )
+        else:
+            decay_penalty = 0.0
+
+        if not topic["qualifies"]:
+            _demote_topic(topic, now=now)
+            topic["queue_rank"] = None
+        _set_topic_queue_score(
+            topic,
+            importance_score=importance,
+            approaching_bonus=approaching_bonus,
+            decay_penalty=decay_penalty,
+        )
+        topic["queue_event_start_at"] = window.start_at
+        topic["queue_event_end_at"] = window.end_at
+        topic["queue_time_precision"] = window.precision
+        topic["calculated_at"] = now.isoformat()
+        topic["last_queue_error"] = None
+        topic["last_queue_error_at"] = None
+        return window
+
+    @staticmethod
+    def _rebalance_scope(
+        scope: dict[str, Any],
+        *,
+        now: datetime,
+        mode: str,
+        policy: TopicQueuePolicy,
+        affected_topic_keys: set[str] | None = None,
+    ) -> QueueRebalanceResult:
+        if mode not in {"scheduled", "ingest", "vacancy"}:
+            raise ValueError(f"不支持的 Topic 队列重排模式：{mode}")
+
+        topics = [item for item in scope.get("topics", {}).values() if isinstance(item, dict)]
+        migration_pending = any(item.get("queue_migration_pending") for item in topics)
+        if migration_pending:
+            for topic in topics:
+                if topic.get("lifecycle_status") not in {"active", "suppressed"}:
+                    topic.pop("queue_migration_pending", None)
+                    continue
+                topic["lifecycle_status"] = "suppressed"
+                topic["candidate_source"] = "new"
+                topic["attention_status"] = "open"
+                topic["core_entered_at"] = None
+                topic["demoted_at"] = None
+                topic["penalty_at_demotion"] = 0.0
+                topic["decay_penalty"] = 0.0
+                topic.pop("queue_migration_pending", None)
+
+        previous_statuses = {
+            str(topic.get("topic_id")): str(topic.get("lifecycle_status")) for topic in topics
+        }
+        windows: dict[str, TopicEventWindow] = {}
+        failed_topic_ids: set[str] = set()
+        retired_ids: list[str] = []
+        automatic_demoted_ids: list[str] = []
+        for topic in topics:
+            topic_id = str(topic.get("topic_id"))
+            should_recalculate = (
+                mode == "scheduled"
+                or migration_pending
+                or affected_topic_keys is None
+                or str(topic.get("topic_key")) in affected_topic_keys
+            )
+            if not should_recalculate:
+                windows[topic_id] = _topic_event_window(scope, topic)
+                continue
+            before = dict(topic)
+            try:
+                windows[topic_id] = TopicStore._recalculate_queue_topic(
+                    scope,
+                    topic,
+                    now=now,
+                    policy=policy,
+                )
+            except (TypeError, ValueError, OverflowError, AttributeError, KeyError) as exc:
+                topic.clear()
+                topic.update(before)
+                topic["last_queue_error"] = str(exc)
+                topic["last_queue_error_at"] = now.isoformat()
+                failed_topic_ids.add(topic_id)
+                windows[topic_id] = TopicEventWindow(None, None, "unknown", None)
+            if (
+                topic.get("lifecycle_status") == "retired"
+                and previous_statuses.get(topic_id) != "retired"
+            ):
+                retired_ids.append(topic_id)
+            if (
+                topic.get("lifecycle_status") == "suppressed"
+                and previous_statuses.get(topic_id) == "active"
+            ):
+                automatic_demoted_ids.append(topic_id)
+
+        online = [
+            topic
+            for topic in topics
+            if topic.get("lifecycle_status") in {"active", "suppressed"}
+            and topic.get("qualifies") is True
+            and topic.get("selection_version") == TOPIC_SELECTION_VERSION
+        ]
+
+        def ordered(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            return sorted(
+                items,
+                key=lambda item: _queue_topic_sort_key(
+                    item,
+                    window=windows.get(
+                        str(item.get("topic_id")),
+                        TopicEventWindow(None, None, "unknown", None),
+                    ),
+                    timezone_name=policy.timezone_name,
+                ),
+            )
+
+        cores = ordered([topic for topic in online if topic.get("lifecycle_status") == "active"])
+        while len(cores) > policy.core_limit:
+            demotable = [
+                topic
+                for topic in reversed(cores)
+                if str(topic.get("topic_id")) not in failed_topic_ids
+            ]
+            if not demotable:
+                break
+            for topic in demotable[:1]:
+                _demote_topic(topic, now=now)
+                automatic_demoted_ids.append(str(topic.get("topic_id")))
+                penalty = calculate_demoted_candidate_penalty(
+                    topic.get("demoted_at"),
+                    float(topic.get("penalty_at_demotion", 0.0) or 0.0),
+                    now,
+                )
+                _set_topic_queue_score(
+                    topic,
+                    importance_score=float(topic.get("importance_score", 0.0) or 0.0),
+                    approaching_bonus=float(topic.get("approaching_bonus", 0.0) or 0.0),
+                    decay_penalty=penalty,
+                )
+            cores = ordered(
+                [topic for topic in online if topic.get("lifecycle_status") == "active"]
+            )
+
+        def promotable_candidates() -> list[dict[str, Any]]:
+            return ordered(
+                [
+                    topic
+                    for topic in online
+                    if topic.get("lifecycle_status") == "suppressed"
+                    and topic.get("attention_status") != "past_unconfirmed"
+                    and str(topic.get("topic_id")) not in failed_topic_ids
+                    and (
+                        mode != "ingest"
+                        or affected_topic_keys is None
+                        or str(topic.get("topic_key")) in affected_topic_keys
+                    )
+                ]
+            )
+
+        promoted_ids: list[str] = []
+        demoted_ids: list[str] = list(automatic_demoted_ids)
+
+        if mode in {"scheduled", "vacancy"}:
+            while len(cores) < policy.core_limit:
+                candidates = promotable_candidates()
+                if not candidates:
+                    break
+                candidate = candidates[0]
+                _promote_topic(candidate, now=now)
+                promoted_ids.append(str(candidate["topic_id"]))
+                cores = ordered([*cores, candidate])
+
+        if mode == "scheduled" and len(cores) == policy.core_limit:
+            while True:
+                candidates = promotable_candidates()
+                if not candidates:
+                    break
+                candidate = candidates[0]
+                replaceable_cores = [
+                    topic for topic in cores if str(topic.get("topic_id")) not in failed_topic_ids
+                ]
+                if not replaceable_cores:
+                    break
+                lowest_core = max(
+                    replaceable_cores,
+                    key=lambda item: _queue_topic_sort_key(
+                        item,
+                        window=windows.get(
+                            str(item.get("topic_id")),
+                            TopicEventWindow(None, None, "unknown", None),
+                        ),
+                        timezone_name=policy.timezone_name,
+                    ),
+                )
+                if (
+                    float(candidate.get("queue_score", 0.0))
+                    < float(lowest_core.get("queue_score", 0.0)) + policy.scheduled_promotion_margin
+                ):
+                    break
+                _demote_topic(lowest_core, now=now)
+                penalty = calculate_demoted_candidate_penalty(
+                    lowest_core.get("demoted_at"),
+                    float(lowest_core.get("penalty_at_demotion", 0.0) or 0.0),
+                    now,
+                )
+                _set_topic_queue_score(
+                    lowest_core,
+                    importance_score=float(lowest_core.get("importance_score", 0.0) or 0.0),
+                    approaching_bonus=float(lowest_core.get("approaching_bonus", 0.0) or 0.0),
+                    decay_penalty=penalty,
+                )
+                _promote_topic(candidate, now=now)
+                demoted_ids.append(str(lowest_core["topic_id"]))
+                promoted_ids.append(str(candidate["topic_id"]))
+                cores = ordered(
+                    [topic for topic in online if topic.get("lifecycle_status") == "active"]
+                )
+
+        if mode == "ingest":
+            next_slot = next_scheduled_slot(now, policy.timezone_name)
+            for candidate in promotable_candidates():
+                window = windows.get(
+                    str(candidate.get("topic_id")),
+                    TopicEventWindow(None, None, "unknown", None),
+                )
+                if window.precision != "datetime" or not window.start_at:
+                    continue
+                try:
+                    event_start = datetime.fromisoformat(window.start_at.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                reference_now = (
+                    now if now.tzinfo else now.replace(tzinfo=ZoneInfo(policy.timezone_name))
+                )
+                if event_start.tzinfo is None:
+                    event_start = event_start.replace(tzinfo=ZoneInfo(policy.timezone_name))
+                event_start = event_start.astimezone(reference_now.tzinfo)
+                if not (reference_now < event_start < next_slot.astimezone(reference_now.tzinfo)):
+                    continue
+                if len(cores) < policy.core_limit:
+                    _promote_topic(candidate, now=now)
+                    promoted_ids.append(str(candidate["topic_id"]))
+                    cores = ordered([*cores, candidate])
+                    continue
+                replaceable_cores = [
+                    topic for topic in cores if str(topic.get("topic_id")) not in failed_topic_ids
+                ]
+                if not replaceable_cores:
+                    break
+                lowest_core = max(
+                    replaceable_cores,
+                    key=lambda item: _queue_topic_sort_key(
+                        item,
+                        window=windows.get(
+                            str(item.get("topic_id")),
+                            TopicEventWindow(None, None, "unknown", None),
+                        ),
+                        timezone_name=policy.timezone_name,
+                    ),
+                )
+                if (
+                    float(candidate.get("queue_score", 0.0))
+                    < float(lowest_core.get("queue_score", 0.0)) + policy.immediate_promotion_margin
+                ):
+                    continue
+                _demote_topic(lowest_core, now=now)
+                _promote_topic(candidate, now=now)
+                demoted_ids.append(str(lowest_core["topic_id"]))
+                promoted_ids.append(str(candidate["topic_id"]))
+                cores = ordered(
+                    [topic for topic in online if topic.get("lifecycle_status") == "active"]
+                )
+
+        cores = ordered([topic for topic in online if topic.get("lifecycle_status") == "active"])
+        candidates = ordered(
+            [topic for topic in online if topic.get("lifecycle_status") == "suppressed"]
+        )
+
+        def assign_lane_ranks(items: list[dict[str, Any]]) -> None:
+            reserved_ranks = {
+                int(topic["queue_rank"])
+                for topic in items
+                if str(topic.get("topic_id")) in failed_topic_ids
+                and isinstance(topic.get("queue_rank"), int)
+                and int(topic["queue_rank"]) > 0
+            }
+            next_rank = 1
+            for topic in items:
+                if str(topic.get("topic_id")) in failed_topic_ids:
+                    continue
+                while next_rank in reserved_ranks:
+                    next_rank += 1
+                topic["queue_rank"] = next_rank
+                next_rank += 1
+
+        assign_lane_ranks(cores)
+        assign_lane_ranks(candidates)
+        for topic in cores:
+            if str(topic.get("topic_id")) not in failed_topic_ids:
+                topic["candidate_source"] = None
+        transitioned_topic_ids = {
+            *promoted_ids,
+            *demoted_ids,
+            *retired_ids,
+        }
+        for topic in topics:
+            topic_id = str(topic.get("topic_id"))
+            if topic not in cores and topic not in candidates and topic_id not in failed_topic_ids:
+                topic["queue_rank"] = None
+            if topic_id not in failed_topic_ids and topic_id in transitioned_topic_ids:
+                topic["calculated_at"] = now.isoformat()
+        scope["queue_calculated_at"] = now.isoformat()
+
+        visible_candidates = candidates[: policy.visible_candidate_limit]
+        return QueueRebalanceResult(
+            core_topic_ids=[str(topic["topic_id"]) for topic in cores],
+            visible_candidate_topic_ids=[str(topic["topic_id"]) for topic in visible_candidates],
+            hidden_candidate_count=max(0, len(candidates) - len(visible_candidates)),
+            promoted_topic_ids=list(dict.fromkeys(promoted_ids)),
+            demoted_topic_ids=list(dict.fromkeys(demoted_ids)),
+            retired_topic_ids=list(dict.fromkeys(retired_ids)),
+            calculated_at=now.isoformat(),
+        )
+
+    def rebalance_queue(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        now: datetime,
+        mode: str,
+        policy: TopicQueuePolicy = DEFAULT_TOPIC_QUEUE_POLICY,
+        affected_topic_keys: set[str] | None = None,
+    ) -> QueueRebalanceResult:
+        def mutate(state: dict[str, Any]) -> QueueRebalanceResult:
+            scope = self._scope(state, user_id, cube_id, create=True)
+            assert scope is not None
+            return self._rebalance_scope(
+                scope,
+                now=now,
+                mode=mode,
+                policy=policy,
+                affected_topic_keys=affected_topic_keys,
+            )
+
+        return self.mutate_queue_state(mutate)
+
+    def rebalance_all_scopes(
+        self,
+        *,
+        now: datetime,
+        scheduled_slot: datetime,
+        policy: TopicQueuePolicy = DEFAULT_TOPIC_QUEUE_POLICY,
+    ) -> dict[str, Any]:
+        with self._lock:
+            state = self._read_unlocked()
+            slot_value = scheduled_slot.isoformat()
+            if state.get("last_scheduled_slot") == slot_value:
+                return {"already_applied": True, "scheduled_slot": slot_value, "scopes": {}}
+            results = {}
+            for scope_key, scope in state.get("scopes", {}).items():
+                if not isinstance(scope, dict):
+                    continue
+                result = self._rebalance_scope(
+                    scope,
+                    now=now,
+                    mode="scheduled",
+                    policy=policy,
+                )
+                results[str(scope_key)] = asdict(result)
+            state["last_scheduled_slot"] = slot_value
+            result = {"already_applied": False, "scheduled_slot": slot_value, "scopes": results}
+            self._write_unlocked(state)
+            return result
 
     def rebalance(
         self,
@@ -1490,27 +2650,64 @@ class TopicStore:
         limit: int,
         topic_date: str | None = None,
     ) -> None:
-        del topic_date
-        state = self._read()
+        """Compatibility wrapper; the core limit is fixed by Queue Policy v1."""
+        del limit, topic_date
+        self.rebalance_queue(
+            user_id=user_id,
+            cube_id=cube_id,
+            now=datetime.now().astimezone(),
+            mode="scheduled",
+            policy=DEFAULT_TOPIC_QUEUE_POLICY,
+        )
+
+    def list_queue_snapshot(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        policy: TopicQueuePolicy = DEFAULT_TOPIC_QUEUE_POLICY,
+    ) -> dict[str, Any]:
+        state = self._read_snapshot()
         scope = self._scope(state, user_id, cube_id)
         if scope is None:
-            return
-        eligible = [
-            item
-            for item in scope["topics"].values()
-            if item.get("lifecycle_status") in {"active", "suppressed"}
-        ]
-        eligible.sort(
-            key=lambda item: (
-                -float(item.get("rank_score", 0.0)),
-                -_datetime_sort_value(item.get("last_evidence_at")),
-                str(item.get("topic_key", "")),
-            )
+            return {
+                "items": [],
+                "pool_total": 0,
+                "candidate_pool_total": 0,
+                "core_count": 0,
+                "visible_candidate_count": 0,
+                "hidden_candidate_count": 0,
+                "queue_calculated_at": None,
+            }
+        cores = sorted(
+            [
+                topic
+                for topic in scope["topics"].values()
+                if topic.get("lifecycle_status") == "active" and topic.get("qualifies") is True
+                and topic.get("selection_version") == TOPIC_SELECTION_VERSION
+            ],
+            key=lambda topic: int(topic.get("queue_rank") or 10_000),
         )
-        active_ids = {item["topic_id"] for item in eligible[: max(1, limit)]}
-        for item in eligible:
-            item["lifecycle_status"] = "active" if item["topic_id"] in active_ids else "suppressed"
-        self._write(state)
+        candidates = sorted(
+            [
+                topic
+                for topic in scope["topics"].values()
+                if topic.get("lifecycle_status") == "suppressed" and topic.get("qualifies") is True
+                and topic.get("selection_version") == TOPIC_SELECTION_VERSION
+            ],
+            key=lambda topic: int(topic.get("queue_rank") or 10_000),
+        )
+        visible_candidates = candidates[: policy.visible_candidate_limit]
+        items = [*cores[: policy.core_limit], *visible_candidates]
+        return {
+            "items": json.loads(json.dumps(items, ensure_ascii=False)),
+            "pool_total": len(cores) + len(candidates),
+            "candidate_pool_total": len(candidates),
+            "core_count": min(len(cores), policy.core_limit),
+            "visible_candidate_count": len(visible_candidates),
+            "hidden_candidate_count": max(0, len(candidates) - len(visible_candidates)),
+            "queue_calculated_at": scope.get("queue_calculated_at"),
+        }
 
     def list_topics(
         self,
@@ -1521,18 +2718,22 @@ class TopicStore:
         include_suppressed: bool = False,
     ) -> list[dict[str, Any]]:
         del topic_date
-        state = self._read()
+        state = self._read_snapshot()
         scope = self._scope(state, user_id, cube_id)
         if scope is None:
             return []
         statuses = {"active", "suppressed"} if include_suppressed else {"active"}
         result = [
-            item for item in scope["topics"].values() if item.get("lifecycle_status") in statuses
+            item
+            for item in scope["topics"].values()
+            if item.get("lifecycle_status") in statuses
+            and item.get("selection_version") == TOPIC_SELECTION_VERSION
         ]
         result.sort(
             key=lambda item: (
-                -float(item.get("rank_score", 0.0)),
-                -_datetime_sort_value(item.get("last_evidence_at")),
+                0 if item.get("lifecycle_status") == "active" else 1,
+                int(item.get("queue_rank") or 10_000),
+                -float(item.get("queue_score", item.get("rank_score", 0.0)) or 0.0),
             )
         )
         return json.loads(json.dumps(result, ensure_ascii=False))
@@ -1545,12 +2746,23 @@ class TopicStore:
         include_suppressed: bool = False,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
-        """Return the current rolling pool; dates are display metadata, not partitions."""
-        return self.list_topics(
-            user_id=user_id,
-            cube_id=cube_id,
-            include_suppressed=include_suppressed,
-        )[: max(1, min(limit, 2000))]
+        """Return saved Topic records, including legacy versions for history/debugging."""
+        state = self._read_snapshot()
+        scope = self._scope(state, user_id, cube_id)
+        if scope is None:
+            return []
+        statuses = {"active", "suppressed"} if include_suppressed else {"active"}
+        result = [
+            item for item in scope["topics"].values() if item.get("lifecycle_status") in statuses
+        ]
+        result.sort(
+            key=lambda item: (
+                0 if item.get("lifecycle_status") == "active" else 1,
+                int(item.get("queue_rank") or 10_000),
+                -float(item.get("queue_score", item.get("rank_score", 0.0)) or 0.0),
+            )
+        )
+        return json.loads(json.dumps(result[: max(1, min(limit, 2000))], ensure_ascii=False))
 
 
 def default_store_path() -> Path:
@@ -2102,6 +3314,73 @@ def _memory_revision(memory: dict[str, Any]) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def topic_memory_revision(memory: dict[str, Any]) -> str:
+    """Return the stable revision used to compare MemOS and Topic snapshots."""
+    return _memory_revision(memory)
+
+
+_TOPIC_LIFECYCLE_INFO_FIELDS = frozenset(
+    {
+        "event_status",
+        "event_time",
+        "event_start_time",
+        "event_end_time",
+        "event_start_at",
+        "event_end_at",
+    }
+)
+
+
+def _topic_semantic_memory(memory: dict[str, Any]) -> dict[str, Any]:
+    """Return fields whose changes require Topic model analysis."""
+    metadata = memory.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    info = {
+        key: value
+        for key, value in _memory_info(memory).items()
+        if key not in _TOPIC_LIFECYCLE_INFO_FIELDS
+    }
+    return {
+        "memory": _memory_text(memory),
+        "memory_type": memory.get("memory_type"),
+        "status": metadata.get("status", "activated"),
+        "created_at": metadata.get("created_at") or memory.get("created_at"),
+        "info": info,
+    }
+
+
+def _topic_semantic_tag(item: TagEvidence) -> dict[str, Any]:
+    """Keep grouping evidence while excluding lifecycle-only values."""
+    return {
+        "memory_id": item.memory_id,
+        "topic_key": item.topic_key,
+        "tag_name": item.tag_name,
+        "relationship": item.relationship,
+        "initiative_type": item.initiative_type,
+        "reason": item.reason,
+        "evidence_unit": item.evidence_unit,
+    }
+
+
+def _refresh_lifecycle_evidence(
+    memory: dict[str, Any],
+    evidence: list[TagEvidence],
+) -> list[TagEvidence]:
+    info = _memory_info(memory)
+    event_status = str(info.get("event_status") or "uncertain").strip().lower()
+    if event_status not in STATUS_WEIGHTS:
+        event_status = "uncertain"
+    event_time = _memory_event_time(memory)
+    return [
+        replace(
+            item,
+            event_status=event_status,
+            event_time=event_time,
+        )
+        for item in evidence
+    ]
+
+
 def _memory_info(memory: dict[str, Any]) -> dict[str, Any]:
     metadata = memory.get("metadata")
     if not isinstance(metadata, dict):
@@ -2135,6 +3414,12 @@ def _is_active_event_memory(memory: dict[str, Any]) -> bool:
     metadata = memory.get("metadata")
     status = metadata.get("status", "activated") if isinstance(metadata, dict) else "activated"
     return status == "activated" and _memory_info(memory).get("record_type") == "event"
+
+
+def _is_current_topic_memory(memory: dict[str, Any]) -> bool:
+    """Return whether an event may contribute to a current Topic."""
+    event_status = str(_memory_info(memory).get("event_status") or "uncertain").strip().lower()
+    return _is_active_event_memory(memory) and event_status not in {"completed", "cancelled"}
 
 
 def _memory_event_time(memory: dict[str, Any]) -> str | None:
@@ -2275,43 +3560,75 @@ def _refresh_memory_assessment_score(
     now: datetime,
 ) -> MemoryAssessment:
     """Normalize old saved assessments to the current static-importance model."""
-    del memory, now
-    if not assessment.eligible:
-        return assessment
+    del now
     breakdown = dict(assessment.score_breakdown)
-    if breakdown.get("model") == "static_importance_v3":
-        return assessment
-    confidence_factor = float(
-        breakdown.get("confidence_factor", CONFIDENCE_FACTORS.get(assessment.confidence, 0.5))
-    )
-    old_urgency = float(breakdown.get("urgency_points", 0.0))
-    fixed_point_keys = (
-        "agency_points",
-        "action_points",
-        "impact_points",
-        "priority_points",
-        "effort_points",
-    )
-    if all(key in breakdown for key in fixed_point_keys):
-        fixed_points = sum(float(breakdown[key]) for key in fixed_point_keys)
-    elif confidence_factor > 0:
-        fixed_points = max(0.0, assessment.score / confidence_factor - old_urgency)
-    else:
-        fixed_points = 0.0
-    score = round(min(100.0, fixed_points) * confidence_factor, 2)
-    breakdown.update(
-        {
-            "urgency_points": 0.0,
-            "confidence_factor": confidence_factor,
-            "memory_score": score,
-            "importance_score": score,
-            "model": "static_importance_v3",
-        }
-    )
+    if assessment.selection_version == TOPIC_SELECTION_VERSION:
+        if breakdown.get("model") == "static_importance_v3":
+            return assessment
+        # Keep compatibility with current-version programmatic assessments that
+        # provide an explicit score but predate the model marker. Real v2 state
+        # follows the deterministic label-based branch below.
+        confidence_factor = float(
+            breakdown.get(
+                "confidence_factor",
+                CONFIDENCE_FACTORS.get(assessment.confidence, 0.5),
+            )
+        )
+        old_urgency = float(breakdown.get("urgency_points", 0.0))
+        fixed_point_keys = (
+            "agency_points",
+            "action_points",
+            "impact_points",
+            "priority_points",
+            "effort_points",
+        )
+        if all(key in breakdown for key in fixed_point_keys):
+            fixed_points = sum(float(breakdown[key]) for key in fixed_point_keys)
+        elif confidence_factor > 0:
+            fixed_points = max(0.0, assessment.score / confidence_factor - old_urgency)
+        else:
+            fixed_points = 0.0
+        score = round(min(100.0, fixed_points) * confidence_factor, 2)
+        breakdown.update(
+            {
+                "urgency_points": 0.0,
+                "confidence_factor": confidence_factor,
+                "memory_score": score,
+                "importance_score": score,
+                "model": "static_importance_v3",
+            }
+        )
+        return replace(assessment, score=score, score_breakdown=breakdown)
+
+    # v2 and v3 share these explicit judgement labels. Recalculate from the
+    # labels instead of trusting a historical score breakdown, so the migration
+    # is deterministic and the old time-based urgency points cannot leak into
+    # static importance.
+    agency_points = AGENCY_POINTS[assessment.agency]
+    action_points = ACTION_POINTS[assessment.action_requirement]
+    impact_points = IMPACT_POINTS[assessment.impact]
+    priority_points = PRIORITY_POINTS[assessment.explicit_priority]
+    effort_points = max(EFFORT_POINTS[assessment.effort], _memory_effort_points(memory))
+    confidence_factor = CONFIDENCE_FACTORS[assessment.confidence]
+    raw_score = agency_points + action_points + impact_points + priority_points + effort_points
+    score = round(min(100.0, raw_score) * confidence_factor, 2) if assessment.eligible else 0.0
+    breakdown = {
+        "agency_points": agency_points,
+        "action_points": action_points,
+        "urgency_points": 0.0,
+        "impact_points": impact_points,
+        "priority_points": priority_points,
+        "effort_points": effort_points,
+        "confidence_factor": confidence_factor,
+        "memory_score": score,
+        "importance_score": score,
+        "model": "static_importance_v3",
+    }
     return replace(
         assessment,
         score=score,
         score_breakdown=breakdown,
+        selection_version=TOPIC_SELECTION_VERSION,
     )
 
 
@@ -2325,12 +3642,33 @@ def compute_topic_metrics(
     """Score one confirmed memory group using strongest + half supporting evidence."""
     memory_by_id = {_memory_id(memory): memory for memory in memories}
     reference_now = now or datetime.now().astimezone()
-    valid = [
+    eligible = [
         _refresh_memory_assessment_score(memory_by_id[item.memory_id], item, reference_now)
         for item in assessments
         if item.eligible and item.memory_id in memory_by_id
     ]
+    valid = [
+        item
+        for item in eligible
+        if str(_memory_info(memory_by_id[item.memory_id]).get("event_status") or "uncertain")
+        not in {"completed", "cancelled"}
+    ]
     if not valid:
+        status_observations = [
+            (
+                _parse_datetime(_memory_observed_at(memory_by_id[item.memory_id])),
+                str(_memory_info(memory_by_id[item.memory_id]).get("event_status") or "uncertain"),
+            )
+            for item in eligible
+        ]
+        dated_statuses = [item for item in status_observations if item[0] is not None]
+        progress_status = (
+            max(dated_statuses, key=lambda item: item[0])[1]
+            if dated_statuses
+            else status_observations[-1][1]
+            if status_observations
+            else "uncertain"
+        )
         return CandidateMetrics(
             evidence_count=0,
             relationship_vote_sum=0.0,
@@ -2347,6 +3685,7 @@ def compute_topic_metrics(
                 "rank_score": 0.0,
             },
             candidate_reasons=[],
+            progress_status=progress_status,
             importance_score=0.0,
         )
 
@@ -2354,7 +3693,21 @@ def compute_topic_metrics(
     for item in valid:
         text_key = _normalized_memory_text(memory_by_id[item.memory_id]) or item.memory_id
         current = best_by_text.get(text_key)
-        if current is None or item.score > current.score:
+        item_observed = _parse_datetime(_memory_observed_at(memory_by_id[item.memory_id]))
+        current_observed = (
+            _parse_datetime(_memory_observed_at(memory_by_id[current.memory_id]))
+            if current is not None
+            else None
+        )
+        if (
+            current is None
+            or item.score > current.score
+            or (
+                item.score == current.score
+                and item_observed is not None
+                and (current_observed is None or item_observed < current_observed)
+            )
+        ):
             best_by_text[text_key] = item
     counted = sorted(best_by_text.values(), key=lambda item: item.score, reverse=True)
     scores = [item.score for item in counted]
@@ -2364,7 +3717,7 @@ def compute_topic_metrics(
 
     observed = [
         parsed
-        for item in valid
+        for item in counted
         if (parsed := _parse_datetime(_memory_observed_at(memory_by_id[item.memory_id])))
     ]
     latest = max(observed) if observed else None
@@ -2652,13 +4005,12 @@ def _selection_fingerprint(
         "memories": [
             {
                 "memory_id": memory_id,
-                "memory": _memory_text(memory_by_id[memory_id]),
-                "metadata": memory_by_id[memory_id].get("metadata", {}),
+                "memory": _topic_semantic_memory(memory_by_id[memory_id]),
                 "assessment": {
                     "eligible": assessments_by_id[memory_id].eligible,
                     **_assessment_judgements(assessments_by_id[memory_id]),
                 },
-                "tags": [asdict(item) for item in tags_by_memory.get(memory_id, [])],
+                "tags": [_topic_semantic_tag(item) for item in tags_by_memory.get(memory_id, [])],
             }
             for memory_id in sorted(memory_ids)
         ],
@@ -2679,11 +4031,13 @@ class TopicProcessor:
         memos_client: MemOSMemoryClient,
         llm: TopicLLM,
         daily_limit: int = 15,
+        policy: TopicQueuePolicy = DEFAULT_TOPIC_QUEUE_POLICY,
     ) -> None:
         self.store = store
         self.memos_client = memos_client
         self.llm = llm
         self.daily_limit = daily_limit
+        self.policy = policy
 
     def process_added_response(
         self,
@@ -2719,6 +4073,49 @@ class TopicProcessor:
                 retire_legacy_topics=retire_legacy_topics,
             )
 
+    def refresh_memory_ids(
+        self,
+        *,
+        memory_ids: list[str],
+        user_id: str,
+        cube_id: str,
+    ) -> int:
+        """Refresh exact IDs, reusing model output for lifecycle-only revisions."""
+        unique_ids = list(dict.fromkeys(memory_id for memory_id in memory_ids if memory_id))
+        if not unique_ids:
+            return 0
+
+        with self.store.transaction():
+            memories = self.memos_client.get_by_ids(unique_ids)
+            active_by_id = {
+                _memory_id(memory): memory for memory in memories if _is_active_event_memory(memory)
+            }
+            unavailable_ids = [
+                memory_id for memory_id in unique_ids if memory_id not in active_by_id
+            ]
+            stored_unavailable_ids = [
+                memory_id
+                for memory_id in unavailable_ids
+                if self.store.active_memory_scopes(memory_id)
+            ]
+            unresolved_ids = [
+                memory_id
+                for memory_id in unavailable_ids
+                if memory_id not in stored_unavailable_ids
+            ]
+
+            removed = self._reconcile() if stored_unavailable_ids else 0
+            processed = 0
+            if active_by_id:
+                processed = self._process_memory_ids(
+                    memory_ids=list(active_by_id),
+                    user_id=user_id,
+                    cube_id=cube_id,
+                )
+            if unresolved_ids:
+                raise RuntimeError("MemOS 暂时没有返回这些记忆：" + "、".join(unresolved_ids))
+            return processed + removed
+
     def _process_memory_ids(
         self,
         *,
@@ -2735,9 +4132,36 @@ class TopicProcessor:
 
         catalog = self.store.tag_catalog(user_id, cube_id)
         reference_now = datetime.now().astimezone()
+        stored_memories, stored_assessments, stored_tags = self.store.active_selection_data(
+            user_id,
+            cube_id,
+        )
+        stored_memory_by_id = {_memory_id(item): item for item in stored_memories}
         processed_memories = 0
+        changed_memory_ids: set[str] = set()
         for memory in memories:
             if not _is_active_event_memory(memory):
+                continue
+            memory_id = _memory_id(memory)
+            stored_memory = stored_memory_by_id.get(memory_id)
+            stored_assessment = stored_assessments.get(memory_id)
+            if (
+                stored_memory is not None
+                and stored_assessment is not None
+                and _topic_semantic_memory(stored_memory) == _topic_semantic_memory(memory)
+            ):
+                if _memory_revision(stored_memory) == _memory_revision(memory):
+                    continue
+                evidence = _refresh_lifecycle_evidence(memory, stored_tags.get(memory_id, []))
+                self.store.save_memory(user_id=user_id, cube_id=cube_id, memory=memory)
+                self.store.replace_tags(
+                    user_id=user_id,
+                    cube_id=cube_id,
+                    memory_id=memory_id,
+                    evidence=evidence,
+                )
+                processed_memories += 1
+                changed_memory_ids.add(memory_id)
                 continue
             analyze = getattr(self.llm, "analyze_memory", None)
             if not callable(analyze):
@@ -2756,25 +4180,39 @@ class TopicProcessor:
             self.store.replace_tags(
                 user_id=user_id,
                 cube_id=cube_id,
-                memory_id=_memory_id(memory),
+                memory_id=memory_id,
                 evidence=evidence,
             )
             catalog.extend(
                 {"topic_key": item.topic_key, "tag_name": item.tag_name} for item in evidence
             )
             processed_memories += 1
+            changed_memory_ids.add(memory_id)
 
-        self._rebuild_topics(
+        affected_topic_keys = self._rebuild_topics(
             user_id=user_id,
             cube_id=cube_id,
             now=reference_now,
             retire_legacy_topics=retire_legacy_topics,
+            affected_memory_ids=changed_memory_ids,
         )
-        self.store.rebalance(
+        queue_result = self.store.rebalance_queue(
             user_id=user_id,
             cube_id=cube_id,
-            limit=self.daily_limit,
+            now=reference_now,
+            mode="ingest",
+            policy=self.policy,
+            affected_topic_keys=affected_topic_keys,
         )
+        if queue_result.retired_topic_ids:
+            self.store.rebalance_queue(
+                user_id=user_id,
+                cube_id=cube_id,
+                now=reference_now,
+                mode="vacancy",
+                policy=self.policy,
+                affected_topic_keys=affected_topic_keys,
+            )
         return processed_memories
 
     def backfill(
@@ -2831,6 +4269,7 @@ class TopicProcessor:
         """Remove Topic votes whose source memory is gone or no longer active in MemOS."""
         active_ids = self.store.active_memory_ids()
         affected: set[tuple[str, str, str]] = set()
+        deactivated_memory_ids_by_scope: dict[tuple[str, str], set[str]] = {}
         changed_by_scope: dict[tuple[str, str], list[str]] = {}
         removed = 0
         for start in range(0, len(active_ids), batch_size):
@@ -2841,7 +4280,12 @@ class TopicProcessor:
             }
             for memory_id in batch:
                 if memory_id not in active_returned:
-                    affected.update(self.store.deactivate_memory(memory_id))
+                    deactivated_topics = self.store.deactivate_memory(memory_id)
+                    affected.update(deactivated_topics)
+                    for user_id, cube_id, _ in deactivated_topics:
+                        deactivated_memory_ids_by_scope.setdefault((user_id, cube_id), set()).add(
+                            memory_id
+                        )
                     removed += 1
                     continue
                 memory = active_returned[memory_id]
@@ -2876,19 +4320,31 @@ class TopicProcessor:
                     regenerate_summary=True,
                 )
 
-        reference_now = datetime.now().astimezone()
         affected_scopes = {(user_id, cube_id) for user_id, cube_id, _ in affected}
-        affected_scopes.update(self.store.scopes_due_for_score_refresh(now=reference_now))
+        reference_now = datetime.now().astimezone()
         for user_id, cube_id in affected_scopes:
-            self._rebuild_topics(
+            affected_topic_keys = {
+                topic_key
+                for affected_user_id, affected_cube_id, topic_key in affected
+                if affected_user_id == user_id and affected_cube_id == cube_id
+            }
+            affected_topic_keys.update(
+                self._rebuild_topics(
+                    user_id=user_id,
+                    cube_id=cube_id,
+                    now=reference_now,
+                    affected_memory_ids=deactivated_memory_ids_by_scope.get(
+                        (user_id, cube_id), set()
+                    ),
+                )
+            )
+            self.store.rebalance_queue(
                 user_id=user_id,
                 cube_id=cube_id,
                 now=reference_now,
-            )
-            self.store.rebalance(
-                user_id=user_id,
-                cube_id=cube_id,
-                limit=self.daily_limit,
+                mode="vacancy",
+                policy=self.policy,
+                affected_topic_keys=affected_topic_keys,
             )
         return removed
 
@@ -2975,12 +4431,24 @@ class TopicProcessor:
         cube_id: str,
         now: datetime,
         retire_legacy_topics: bool = False,
-    ) -> None:
-        memories, assessments_by_id, tags_by_memory = self.store.active_selection_data(
+        affected_memory_ids: set[str] | None = None,
+    ) -> set[str]:
+        audited_memories, audited_assessments, audited_tags = self.store.active_selection_data(
             user_id,
             cube_id,
         )
+        memories = [memory for memory in audited_memories if _is_current_topic_memory(memory)]
         memory_by_id = {_memory_id(memory): memory for memory in memories}
+        assessments_by_id = {
+            memory_id: assessment
+            for memory_id, assessment in audited_assessments.items()
+            if memory_id in memory_by_id
+        }
+        tags_by_memory = {
+            memory_id: evidence
+            for memory_id, evidence in audited_tags.items()
+            if memory_id in memory_by_id
+        }
         groups: list[MemoryGroup] = []
         cached_groupings = self.store.grouping_cache(user_id, cube_id)
         refreshed_groupings: dict[str, list[MemoryGroup]] = {}
@@ -3062,6 +4530,18 @@ class TopicProcessor:
             cube_id,
             include_retired=True,
         )
+        affected_topic_keys = {
+            str(topic.get("topic_key"))
+            for topic in existing_topics
+            if topic.get("topic_key")
+            and (
+                affected_memory_ids is None
+                or bool(
+                    {str(value) for value in topic.get("supporting_memory_ids", [])}
+                    & affected_memory_ids
+                )
+            )
+        }
         occupied_topic_keys = self.store.stored_topic_keys(user_id, cube_id)
         kept_topic_keys: set[str] = set()
         for group, metrics, candidate_tag_keys, evidence in qualified:
@@ -3136,6 +4616,8 @@ class TopicProcessor:
                 )
             kept_topic_keys.add(topic_key)
             occupied_topic_keys.add(topic_key)
+            if affected_memory_ids is None or set(group.memory_ids) & affected_memory_ids:
+                affected_topic_keys.add(topic_key)
 
         self.store.retire_unmatched_topics(
             user_id=user_id,
@@ -3148,6 +4630,7 @@ class TopicProcessor:
             cube_id=cube_id,
             groups_by_fingerprint=refreshed_groupings,
         )
+        return affected_topic_keys
 
     def _recompute_topic(
         self,
@@ -3158,11 +4641,15 @@ class TopicProcessor:
         regenerate_summary: bool,
         now: datetime | None = None,
     ) -> None:
-        evidence = self.store.evidence_for_topic(
-            user_id=user_id,
-            cube_id=cube_id,
-            topic_key=topic_key,
-        )
+        evidence = [
+            item
+            for item in self.store.evidence_for_topic(
+                user_id=user_id,
+                cube_id=cube_id,
+                topic_key=topic_key,
+            )
+            if item.event_status not in {"completed", "cancelled"}
+        ]
         metrics = compute_candidate_metrics(evidence, now=now)
         if not metrics.qualifies:
             self.store.retire_topic(
@@ -3206,38 +4693,100 @@ def process_runtime_topics(
     add_response: Any,
     daily_limit: int = 15,
 ) -> dict[str, Any]:
-    """Process one add response immediately and return the rolling Topic seats."""
+    """Process one add response immediately and return the visible 3+27 snapshot."""
+    del daily_limit
     _load_project_env()
     store = TopicStore(default_store_path())
     processor = TopicProcessor(
         store=store,
         memos_client=MemOSMemoryClient(base_url),
         llm=TopicLLM(TopicModelConfig.from_env()),
-        daily_limit=max(1, daily_limit),
+        daily_limit=DEFAULT_TOPIC_QUEUE_POLICY.core_limit,
+        policy=DEFAULT_TOPIC_QUEUE_POLICY,
     )
     processed_memories = processor.process_added_response(
         response=add_response,
         user_id=user_id,
         cube_id=cube_id,
     )
+    snapshot = store.list_queue_snapshot(
+        user_id=user_id,
+        cube_id=cube_id,
+        policy=DEFAULT_TOPIC_QUEUE_POLICY,
+    )
     return {
         "processed_memories": processed_memories,
-        "rolling_limit": max(1, daily_limit),
-        "topics": store.list_topics(
-            user_id=user_id,
-            cube_id=cube_id,
-        ),
+        "rolling_limit": DEFAULT_TOPIC_QUEUE_POLICY.core_limit,
+        "core_count": snapshot["core_count"],
+        "visible_candidate_count": snapshot["visible_candidate_count"],
+        "hidden_candidate_count": snapshot["hidden_candidate_count"],
+        "topics": snapshot["items"],
     }
 
 
-def reconcile_runtime_topics(*, base_url: str, daily_limit: int = 15) -> int:
-    """Reconcile the external Topic snapshot with active memories in MemOS."""
+def rebalance_runtime_topic_queues(
+    *,
+    now: datetime | None = None,
+    scheduled_slot: datetime | None = None,
+    policy: TopicQueuePolicy | None = None,
+) -> dict[str, Any]:
+    """Recalculate all Topic queues without accessing MemOS or a language model."""
+    _load_project_env()
+    effective_policy = policy or DEFAULT_TOPIC_QUEUE_POLICY
+    zone = ZoneInfo(effective_policy.timezone_name)
+    reference_now = now or datetime.now(zone)
+    if reference_now.tzinfo is None:
+        reference_now = reference_now.replace(tzinfo=zone)
+    else:
+        reference_now = reference_now.astimezone(zone)
+    slot = scheduled_slot or latest_scheduled_slot(
+        reference_now,
+        effective_policy.timezone_name,
+    )
+    return TopicStore(default_store_path()).rebalance_all_scopes(
+        now=reference_now,
+        scheduled_slot=slot,
+        policy=effective_policy,
+    )
+
+
+def refresh_runtime_topics_by_ids(
+    *,
+    base_url: str,
+    user_id: str,
+    cube_id: str,
+    memory_ids: list[str],
+    daily_limit: int = 15,
+) -> int:
+    """Refresh exact MemOS IDs in the external Topic snapshot."""
+    del daily_limit
+    if not memory_ids:
+        return 0
     _load_project_env()
     processor = TopicProcessor(
         store=TopicStore(default_store_path()),
         memos_client=MemOSMemoryClient(base_url),
         llm=TopicLLM(TopicModelConfig.from_env()),
-        daily_limit=max(1, daily_limit),
+        daily_limit=DEFAULT_TOPIC_QUEUE_POLICY.core_limit,
+        policy=DEFAULT_TOPIC_QUEUE_POLICY,
+    )
+    return processor.refresh_memory_ids(
+        memory_ids=list(dict.fromkeys(memory_ids)),
+        user_id=user_id,
+        cube_id=cube_id,
+    )
+
+
+def reconcile_runtime_topics(*, base_url: str, daily_limit: int = 15) -> int:
+    """Reconcile the external Topic snapshot with active memories in MemOS."""
+    del daily_limit
+    _load_project_env()
+    processor = TopicProcessor(
+        store=TopicStore(default_store_path()),
+        memos_client=MemOSMemoryClient(base_url),
+        llm=TopicLLM(TopicModelConfig.from_env()),
+        daily_limit=DEFAULT_TOPIC_QUEUE_POLICY.core_limit,
+        policy=DEFAULT_TOPIC_QUEUE_POLICY,
     )
     return processor.reconcile()
 
@@ -3262,7 +4811,15 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="MemOS 外部 Topic 处理器")
     parser.add_argument(
         "command",
-        choices=["backfill", "run-once", "watch", "reconcile", "list", "migrate-legacy"],
+        choices=[
+            "backfill",
+            "run-once",
+            "watch",
+            "reconcile",
+            "list",
+            "migrate-legacy",
+            "upgrade-selection",
+        ],
     )
     parser.add_argument("--base-url", default="http://127.0.0.1:8000")
     parser.add_argument("--state", "--db", dest="state", default=None)
@@ -3301,6 +4858,13 @@ def main() -> int:
             include_suppressed=args.include_suppressed,
         )
         print(json.dumps(topics, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "upgrade-selection":
+        summary = store.upgrade_selection_versions(
+            user_id=args.user,
+            cube_id=args.cube,
+        )
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
     processor = TopicProcessor(

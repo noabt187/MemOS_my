@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "updated_at": "2026-08-31T08:00:00+08:00",
+  "scopes": {
+    "[\"fixture-user\",\"fixture-cube\"]": {
+      "user_id": "fixture-user",
+      "cube_id": "fixture-cube",
+      "memories": {},
+      "tags": {},
+      "assessments": {},
+      "group_cache": {},
+      "topics": {
+        "exam": {
+          "topic_id": "topic-exam",
+          "topic_key": "exam",
+          "topic_text": "准备虚构考试",
+          "supporting_memory_ids": [],
+          "score_breakdown": {"model": "static_importance_v3", "importance_score": 90, "base_score": 90},
+          "rank_score": 90,
+          "progress_status": "planned",
+          "lifecycle_status": "active",
+          "last_evidence_at": "2026-08-31T08:00:00+08:00"
+        },
+        "interview": {
+          "topic_id": "topic-interview",
+          "topic_key": "interview",
+          "topic_text": "准备虚构面试",
+          "supporting_memory_ids": [],
+          "score_breakdown": {"model": "static_importance_v3", "importance_score": 85, "base_score": 85},
+          "rank_score": 85,
+          "progress_status": "planned",
+          "lifecycle_status": "active",
+          "last_evidence_at": "2026-08-31T08:00:00+08:00"
+        },
+        "project": {
+          "topic_id": "topic-project",
+          "topic_key": "project",
+          "topic_text": "推进虚构项目",
+          "supporting_memory_ids": [],
+          "score_breakdown": {"model": "static_importance_v3", "importance_score": 80, "base_score": 80},
+          "rank_score": 80,
+          "progress_status": "ongoing",
+          "lifecycle_status": "active",
+          "last_evidence_at": "2026-08-31T08:00:00+08:00"
+        },
+        "reading": {
+          "topic_id": "topic-reading",
+          "topic_key": "reading",
+          "topic_text": "完成虚构阅读",
+          "supporting_memory_ids": [],
+          "score_breakdown": {"model": "static_importance_v3", "importance_score": 75, "base_score": 75},
+          "rank_score": 75,
+          "progress_status": "planned",
+          "lifecycle_status": "active",
+          "last_evidence_at": "2026-08-31T08:00:00+08:00"
+        },
+        "exercise": {
+          "topic_id": "topic-exercise",
+          "topic_key": "exercise",
+          "topic_text": "参加虚构训练",
+          "supporting_memory_ids": [],
+          "score_breakdown": {"model": "static_importance_v3", "importance_score": 70, "base_score": 70},
+          "rank_score": 70,
+          "progress_status": "planned",
+          "lifecycle_status": "suppressed",
+          "last_evidence_at": "2026-08-31T08:00:00+08:00"
+        }
+      }
+    }
+  }
+}

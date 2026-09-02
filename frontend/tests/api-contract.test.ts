@@ -41,6 +41,22 @@ const topicFixture = {
   status: "active",
   progress: "planned",
   score: 88.2,
+  queue_rank: 1,
+  candidate_source: null,
+  attention_status: "open",
+  importance_score: 88.2,
+  approaching_bonus: 0,
+  decay_penalty: 0,
+  queue_score: 88.2,
+  queue_score_breakdown: {
+    importance_score: 88.2,
+    approaching_bonus: 0,
+    decay_penalty: 0,
+    queue_score: 88.2,
+  },
+  core_entered_at: "2026-08-26T00:00:00+08:00",
+  demoted_at: null,
+  calculated_at: "2026-08-26T12:00:00+08:00",
   supporting_memory_ids: ["memory-1", "memory-2"],
   evidence: [
     {
@@ -67,8 +83,27 @@ const topicFixture = {
   versions: [],
 };
 
+function topicListFixture(items: Record<string, unknown>[] = [topicFixture]) {
+  const coreCount = items.filter((item) => item.status === "active").length;
+  const visibleCandidateCount = items.filter((item) => item.status === "suppressed").length;
+  const candidatePoolTotal = visibleCandidateCount;
+  return {
+    total: items.length,
+    returned: items.length,
+    pool_total: coreCount + candidatePoolTotal,
+    candidate_pool_total: candidatePoolTotal,
+    core_limit: 3,
+    visible_candidate_limit: 27,
+    core_count: coreCount,
+    visible_candidate_count: visibleCandidateCount,
+    hidden_candidate_count: 0,
+    calculated_at: "2026-08-26T12:00:00+08:00",
+    items,
+  };
+}
+
 test("parses the current Topic importance-score contract without inventing zero dimensions", function (): void {
-  const result = parseTopicList({ total: 1, items: [topicFixture] });
+  const result = parseTopicList(topicListFixture());
   const breakdown = result.items[0].score_breakdown;
 
   assert.equal(breakdown.model, "memory_importance_v2");
@@ -86,7 +121,7 @@ test("rejects a malformed current Topic score instead of silently rendering fals
   malformedTopic.score_breakdown.counted_memory_ids = "memory-1" as unknown as string[];
 
   function parseMalformedTopic(): void {
-    parseTopicList({ total: 1, items: [malformedTopic] });
+    parseTopicList(topicListFixture([malformedTopic]));
   }
 
   function isCountedMemoryContractError(error: unknown): boolean {
@@ -109,7 +144,7 @@ test("keeps legacy Topic scores explicitly separate from the current score model
     status_points: 8,
   } as unknown as typeof topicFixture.score_breakdown;
 
-  const breakdown = parseTopicList({ total: 1, items: [legacyTopic] }).items[0].score_breakdown;
+  const breakdown = parseTopicList(topicListFixture([legacyTopic])).items[0].score_breakdown;
   assert.equal(breakdown.model, "legacy_evidence_v1");
   if (breakdown.model !== "legacy_evidence_v1") {
     assert.fail("expected legacy breakdown");
@@ -123,8 +158,247 @@ test("keeps legacy Topic scores explicitly separate from the current score model
   });
 });
 
+test("accepts an explicit partial score contract for incomplete historical importance data", function (): void {
+  const partialTopic = structuredClone(topicFixture);
+  partialTopic.score_breakdown = {
+    model: "partial",
+    base_score: null,
+    recency_factor: 1,
+    rank_score: 88.2,
+  } as unknown as typeof topicFixture.score_breakdown;
+
+  const breakdown = parseTopicList(topicListFixture([partialTopic])).items[0].score_breakdown;
+
+  assert.equal(breakdown.model, "partial");
+  if (breakdown.model !== "partial") {
+    assert.fail("expected partial breakdown");
+  }
+  assert.equal(breakdown.base_score, null);
+  assert.equal(breakdown.recency_factor, 1);
+  assert.equal(breakdown.rank_score, 88.2);
+});
+
+test("parses the Topic 3+27 queue contract with transparent score breakdown", function (): void {
+  const candidate = {
+    ...structuredClone(topicFixture),
+    id: "topic-2",
+    key: "project",
+    title: "用户正在推进课程项目。",
+    status: "suppressed",
+    score: 76,
+    queue_rank: 1,
+    candidate_source: "demoted",
+    importance_score: 70,
+    approaching_bonus: 16,
+    decay_penalty: 10,
+    queue_score: 76,
+    queue_score_breakdown: {
+      importance_score: 70,
+      approaching_bonus: 16,
+      decay_penalty: 10,
+      queue_score: 76,
+    },
+    core_entered_at: null,
+    demoted_at: "2026-08-25T12:00:00+08:00",
+    score_breakdown: {
+      strongest_memory_score: 70,
+      supporting_memory_points: 0,
+      duplicate_memory_count: 0,
+      counted_memory_ids: ["memory-1"],
+      importance_score: 70,
+      base_score: 70,
+      recency_factor: 1,
+      rank_score: 76,
+      memory_scores: { "memory-1": 70 },
+    },
+  };
+
+  const result = parseTopicList(topicListFixture([topicFixture, candidate]));
+
+  assert.equal(result.core_limit, 3);
+  assert.equal(result.visible_candidate_limit, 27);
+  assert.equal(result.items[1].queue_rank, 1);
+  assert.equal(result.items[1].candidate_source, "demoted");
+  assert.deepEqual(result.items[1].queue_score_breakdown, {
+    importance_score: 70,
+    approaching_bonus: 16,
+    decay_penalty: 10,
+    queue_score: 76,
+  });
+  const breakdown = result.items[1].score_breakdown;
+  assert.equal(breakdown.model, "static_importance_v3");
+  if (breakdown.model !== "static_importance_v3") {
+    assert.fail("expected static importance v3 breakdown");
+  }
+  assert.equal(breakdown.legacy_recency_factor, 1);
+  assert.equal(breakdown.legacy_rank_score, 76);
+});
+
+test("parses core-only Topic responses while preserving complete pool statistics", function (): void {
+  const coreOnly = topicListFixture();
+  coreOnly.pool_total = 33;
+  coreOnly.candidate_pool_total = 32;
+  coreOnly.visible_candidate_count = 0;
+  coreOnly.hidden_candidate_count = 5;
+
+  const result = parseTopicList(coreOnly);
+
+  assert.equal(result.total, 1);
+  assert.equal(result.visible_candidate_count, 0);
+  assert.equal(result.candidate_pool_total, 32);
+  assert.equal(result.hidden_candidate_count, 5);
+  assert.deepEqual(result.items.map((item) => item.status), ["active"]);
+});
+
+test("rejects queue scores outside their documented ranges", function (): void {
+  const invalidCases = [
+    ["importance_score", 101],
+    ["approaching_bonus", 21],
+    ["decay_penalty", -1],
+    ["queue_score", 121],
+  ] as const;
+
+  for (const [field, value] of invalidCases) {
+    const malformed = structuredClone(topicFixture) as Record<string, unknown>;
+    malformed[field] = value;
+    assert.throws(
+      () => parseTopicList(topicListFixture([malformed])),
+      (error: unknown) => error instanceof ApiContractError && error.message.includes(field),
+    );
+  }
+});
+
+test("rejects contradictory Topic queue score aliases, breakdowns and formulas", function (): void {
+  const mismatchedImportance = structuredClone(topicFixture);
+  mismatchedImportance.queue_score_breakdown.importance_score = 80;
+  assert.throws(
+    () => parseTopicList(topicListFixture([mismatchedImportance])),
+    (error: unknown) =>
+      error instanceof ApiContractError && /queue_score_breakdown\.importance_score/.test(error.message),
+  );
+
+  const mismatchedAlias = structuredClone(topicFixture);
+  mismatchedAlias.score = 87;
+  assert.throws(
+    () => parseTopicList(topicListFixture([mismatchedAlias])),
+    (error: unknown) => error instanceof ApiContractError && /score/.test(error.message),
+  );
+
+  const impossibleFormula = structuredClone(topicFixture);
+  impossibleFormula.queue_score = 99;
+  impossibleFormula.score = 99;
+  impossibleFormula.queue_score_breakdown.queue_score = 99;
+  assert.throws(
+    () => parseTopicList(topicListFixture([impossibleFormula])),
+    (error: unknown) => error instanceof ApiContractError && /queue_score/.test(error.message),
+  );
+});
+
+test("rejects inconsistent Topic queue counts, ranks and state combinations", function (): void {
+  const wrongRank = { ...structuredClone(topicFixture), queue_rank: 2 };
+  assert.throws(
+    () => parseTopicList(topicListFixture([wrongRank])),
+    (error: unknown) => error instanceof ApiContractError && /queue_rank/.test(error.message),
+  );
+
+  const activeCandidate = { ...structuredClone(topicFixture), candidate_source: "new" };
+  assert.throws(
+    () => parseTopicList(topicListFixture([activeCandidate])),
+    (error: unknown) => error instanceof ApiContractError && /candidate_source/.test(error.message),
+  );
+
+  const activePast = { ...structuredClone(topicFixture), attention_status: "past_unconfirmed" };
+  assert.throws(
+    () => parseTopicList(topicListFixture([activePast])),
+    (error: unknown) => error instanceof ApiContractError && /past_unconfirmed/.test(error.message),
+  );
+
+  const wrongTotal = { ...topicListFixture(), total: 2 };
+  assert.throws(
+    () => parseTopicList(wrongTotal),
+    (error: unknown) => error instanceof ApiContractError && /total/.test(error.message),
+  );
+
+  const wrongPool = { ...topicListFixture(), pool_total: 2 };
+  assert.throws(
+    () => parseTopicList(wrongPool),
+    (error: unknown) => error instanceof ApiContractError && /pool_total/.test(error.message),
+  );
+
+  const candidateOne = {
+    ...structuredClone(topicFixture),
+    id: "candidate-1",
+    status: "suppressed",
+    queue_rank: 1,
+    candidate_source: "new",
+    core_entered_at: null,
+  };
+  const candidateTwo = {
+    ...structuredClone(candidateOne),
+    id: "candidate-2",
+    queue_rank: 2,
+  };
+  const visibleCandidatesExceedPool = {
+    ...topicListFixture([candidateOne, candidateTwo]),
+    candidate_pool_total: 1,
+    pool_total: 1,
+  };
+  assert.throws(
+    () => parseTopicList(visibleCandidatesExceedPool),
+    (error: unknown) =>
+      error instanceof ApiContractError && /candidate_pool_total/.test(error.message),
+  );
+});
+
+test("dashboard accepts at most three ordered core Topics", function (): void {
+  const dashboard = {
+    backend_status: "online",
+    service_version: "1.2.3",
+    fetched_at: "2026-08-26T10:36:00+08:00",
+    scope: { user_id: "default", cube_id: "default_cube" },
+    counts: {
+      memories: 0,
+      preferences: 0,
+      skills: 0,
+      queue_total: 0,
+      queue_running: 0,
+      queue_waiting: 0,
+      active_topics: 1,
+    },
+    topics: [topicFixture],
+    memories: [],
+  };
+
+  const candidate = {
+    ...structuredClone(topicFixture),
+    status: "suppressed",
+    candidate_source: "new",
+    core_entered_at: null,
+  };
+  assert.throws(
+    () => parseDashboard({ ...dashboard, topics: [candidate] }),
+    (error: unknown) => error instanceof ApiContractError && /response\.topics/.test(error.message),
+  );
+
+  const wrongRank = { ...structuredClone(topicFixture), queue_rank: 2 };
+  assert.throws(
+    () => parseDashboard({ ...dashboard, topics: [wrongRank] }),
+    (error: unknown) => error instanceof ApiContractError && /queue_rank/.test(error.message),
+  );
+
+  const fourTopics = Array.from({ length: 4 }, (_, index) => ({
+    ...structuredClone(topicFixture),
+    id: `core-${index + 1}`,
+    queue_rank: index + 1,
+  }));
+  assert.throws(
+    () => parseDashboard({ ...dashboard, topics: fourTopics }),
+    (error: unknown) => error instanceof ApiContractError && /response\.topics/.test(error.message),
+  );
+});
+
 test("parses a transparent Topic selection trace without recalculating scores", function (): void {
-  const trace = parseTopicSelectionTrace({
+  const tracePayload = {
     topic_id: "topic-1",
     topic_key: "interview",
     available: true,
@@ -137,6 +411,12 @@ test("parses a transparent Topic selection trace without recalculating scores", 
       memory_formula: "min(100, 维度分合计) × 置信系数",
       topic_formula: "最强单条 + 其他非重复记忆 × 0.5",
       rank_formula: "Topic 基础分 × 新鲜系数",
+      queue_policy_version: 1,
+      core_limit: 3,
+      visible_candidate_limit: 27,
+      scheduled_promotion_margin: 5,
+      immediate_promotion_margin: 10,
+      queue_formula: "importance_score + approaching_bonus - decay_penalty",
       rubric: [
         {
           key: "agency",
@@ -160,6 +440,13 @@ test("parses a transparent Topic selection trace without recalculating scores", 
       rank_score: 72,
       rank_position: 1,
       seat_status: "active",
+      importance_score: 80,
+      approaching_bonus: 0,
+      decay_penalty: 8,
+      queue_score: 72,
+      queue_rank: 1,
+      candidate_source: null,
+      attention_status: "open",
       candidate_reasons: ["单条记忆达到门槛"],
     },
     memories: [
@@ -196,7 +483,8 @@ test("parses a transparent Topic selection trace without recalculating scores", 
         ],
       },
     ],
-  });
+  };
+  const trace = parseTopicSelectionTrace(tracePayload);
 
   assert.equal(trace.memories[0].dimensions[0].label, "committed");
   assert.equal(trace.memories[0].dimensions[0].score_value, 25);
@@ -205,6 +493,24 @@ test("parses a transparent Topic selection trace without recalculating scores", 
   }
   assert.equal(trace.decision.rank_score, 72);
   assert.equal(trace.grouping.shared_anchor, "A公司技术面试");
+
+  const activeDemoted = {
+    ...tracePayload,
+    decision: { ...tracePayload.decision, candidate_source: "demoted" },
+  };
+  assert.throws(
+    () => parseTopicSelectionTrace(activeDemoted),
+    (error: unknown) => error instanceof ApiContractError && /candidate_source/.test(error.message),
+  );
+
+  const activePastUnconfirmed = {
+    ...tracePayload,
+    decision: { ...tracePayload.decision, attention_status: "past_unconfirmed" },
+  };
+  assert.throws(
+    () => parseTopicSelectionTrace(activePastUnconfirmed),
+    (error: unknown) => error instanceof ApiContractError && /attention_status/.test(error.message),
+  );
 });
 
 test("keeps unavailable historical Topic traces explicit instead of inventing scores", function (): void {
@@ -242,6 +548,12 @@ test("rejects incomplete Topic trace dimensions instead of defaulting their scor
       memory_formula: "memory formula",
       topic_formula: "topic formula",
       rank_formula: "rank formula",
+      queue_policy_version: 1,
+      core_limit: 3,
+      visible_candidate_limit: 27,
+      scheduled_promotion_margin: 5,
+      immediate_promotion_margin: 10,
+      queue_formula: "importance + approaching - decay",
       rubric: [],
     },
     grouping: {
@@ -258,6 +570,13 @@ test("rejects incomplete Topic trace dimensions instead of defaulting their scor
       rank_score: 80,
       rank_position: 1,
       seat_status: "active",
+      importance_score: 80,
+      approaching_bonus: 0,
+      decay_penalty: 0,
+      queue_score: 80,
+      queue_rank: 1,
+      candidate_source: null,
+      attention_status: "open",
       candidate_reasons: [],
     },
     memories: [

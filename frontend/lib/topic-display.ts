@@ -1,4 +1,10 @@
-import type { TopicScoreBreakdown } from "./api-contract.ts";
+import type {
+  Topic,
+  TopicAttentionStatus,
+  TopicCandidateSource,
+  TopicQueueStatus,
+  TopicScoreBreakdown,
+} from "./api-contract.ts";
 
 const STATUS_LABELS: Readonly<Record<string, string>> = {
   active: "当前席位",
@@ -8,6 +14,7 @@ const STATUS_LABELS: Readonly<Record<string, string>> = {
   completed: "已完成",
   cancelled: "已取消",
   planned: "计划中",
+  due_unverified: "到期未确认",
   uncertain: "状态待定",
   unknown: "状态未知",
 };
@@ -88,6 +95,7 @@ export function getTopicMemoryScoreState(
   memoryId: string,
 ): TopicMemoryScoreState {
   switch (breakdown.model) {
+    case "static_importance_v3":
     case "memory_importance_v2": {
       const score = breakdown.memory_scores[memoryId];
       if (breakdown.counted_memory_ids.includes(memoryId)) {
@@ -120,6 +128,76 @@ export function getTopicMemoryScoreState(
         score: undefined,
       };
   }
+}
+
+export function partitionTopicQueues(items: readonly Topic[]): {
+  core: Topic[];
+  candidates: Topic[];
+} {
+  return {
+    core: items.filter((topic) => topic.status === "active"),
+    candidates: items.filter((topic) => topic.status === "suppressed"),
+  };
+}
+
+export function filterTopicQueues(
+  items: readonly Topic[],
+  query: string,
+  status: "all" | TopicQueueStatus,
+): Topic[] {
+  const normalized = query.trim().toLowerCase();
+  return items.filter((topic) => {
+    if (status !== "all" && topic.status !== status) {
+      return false;
+    }
+    if (!normalized) {
+      return true;
+    }
+    return [topic.key, topic.title, topic.reason, ...topic.candidate_reasons]
+      .join(" ")
+      .toLowerCase()
+      .includes(normalized);
+  });
+}
+
+export function getTopicCandidateSourceLabel(value: TopicCandidateSource): string {
+  const labels: Readonly<Record<Exclude<TopicCandidateSource, null>, string>> = {
+    new: "新增候选",
+    demoted: "核心降级",
+    refreshed: "新证据刷新",
+  };
+  return value === null ? "核心 Topic" : labels[value];
+}
+
+export function getTopicAttentionStatusLabel(value: TopicAttentionStatus): string {
+  return value === "past_unconfirmed" ? "结果待确认" : "正常竞争";
+}
+
+function getDecayPenaltyLabel(topic: Topic): string {
+  if (topic.status === "active") {
+    return "核心席位陈旧衰减";
+  }
+  if (topic.candidate_source === "demoted") {
+    return "从核心降级后的陈旧衰减";
+  }
+  return "陈旧衰减";
+}
+
+export function formatTopicQueueExplanation(topic: Topic): string {
+  const parts = [
+    `重要度 ${formatTopicScore(topic.importance_score)} 分`,
+    `事件临近增加 ${formatTopicScore(topic.approaching_bonus)} 分`,
+  ];
+  if (topic.decay_penalty > 0) {
+    const prefix = getDecayPenaltyLabel(topic);
+    parts.push(`${prefix}扣除 ${formatTopicScore(topic.decay_penalty)} 分`);
+  }
+  parts.push(`当前队列分 ${formatTopicScore(topic.queue_score)} 分`);
+  let result = `${parts.join("；")}。`;
+  if (topic.attention_status === "past_unconfirmed") {
+    result += "事件时间已过，结果仍待确认，暂时只能留在候选队列。";
+  }
+  return result;
 }
 
 export function formatTopicScore(value: number): string {

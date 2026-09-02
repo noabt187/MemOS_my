@@ -15,6 +15,9 @@ from memos.api.product_models import (
     APIADDRequest,
     APIChatCompleteRequest,
     APISearchRequest,
+    EventLifecycleTransitionData,
+    EventLifecycleTransitionRequest,
+    EventLifecycleTransitionResponse,
     MemoryResponse,
     SearchResponse,
     SuggestionResponse,
@@ -73,6 +76,7 @@ def mock_handlers():
         patch("memos.api.routers.server_router.search_handler") as mock_search,
         patch("memos.api.routers.server_router.add_handler") as mock_add,
         patch("memos.api.routers.server_router.chat_handler") as mock_chat,
+        patch("memos.api.routers.server_router.event_lifecycle_handler") as mock_event_lifecycle,
         patch("memos.api.routers.server_router.handlers.suggestion_handler") as mock_suggestion,
         patch("memos.api.routers.server_router.handlers.memory_handler") as mock_memory,
     ):
@@ -103,13 +107,68 @@ def mock_handlers():
             message="Memories retrieved successfully", data=[]
         )
 
+        mock_event_lifecycle.handle_transition.return_value = EventLifecycleTransitionResponse(
+            data=EventLifecycleTransitionData(
+                outcome="applied",
+                memory_id="26cf4a79-85a9-4faf-a891-3588e4f74472",
+                previous_status="planned",
+                current_status="due_unverified",
+                previous_version=3,
+                current_version=4,
+                reason="deadline_reached_without_outcome_evidence",
+            )
+        )
+
         yield {
             "search": mock_search,
             "add": mock_add,
             "chat": mock_chat,
+            "event_lifecycle": mock_event_lifecycle,
             "suggestion": mock_suggestion,
             "memory": mock_memory,
         }
+
+
+class TestEventLifecycleTransition:
+    """Test the internal exact event lifecycle endpoint."""
+
+    def test_transition_uses_narrow_request_and_response_contract(
+        self, mock_handlers, client
+    ) -> None:
+        memory_id = "26cf4a79-85a9-4faf-a891-3588e4f74472"
+
+        response = client.post(
+            "/product/event_lifecycle/transition",
+            json={
+                "user_id": "default",
+                "cube_id": "default_cube",
+                "memory_id": memory_id,
+                "expected_version": 3,
+                "to_status": "due_unverified",
+                "observed_at": "2026-09-01T10:01:00+08:00",
+            },
+        )
+
+        assert response.status_code == 200
+        assert response.json()["data"]["outcome"] == "applied"
+        request = mock_handlers["event_lifecycle"].handle_transition.call_args.args[0]
+        assert isinstance(request, EventLifecycleTransitionRequest)
+        assert request.memory_id == memory_id
+
+    def test_transition_rejects_naive_observation_time(self, mock_handlers, client) -> None:
+        response = client.post(
+            "/product/event_lifecycle/transition",
+            json={
+                "user_id": "default",
+                "cube_id": "default_cube",
+                "memory_id": "26cf4a79-85a9-4faf-a891-3588e4f74472",
+                "expected_version": 3,
+                "to_status": "due_unverified",
+                "observed_at": "2026-09-01T10:01:00",
+            },
+        )
+
+        assert response.status_code == 422
 
 
 class TestServerRouterSearch:

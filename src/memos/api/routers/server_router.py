@@ -22,6 +22,7 @@ from memos.api.handlers.add_handler import AddHandler
 from memos.api.handlers.base_handler import HandlerDependencies
 from memos.api.handlers.chat_handler import ChatHandler
 from memos.api.handlers.cube_handler import CubeHandler
+from memos.api.handlers.event_lifecycle_handler import EventLifecycleHandler
 from memos.api.handlers.feedback_handler import FeedbackHandler
 from memos.api.handlers.search_handler import SearchHandler
 from memos.api.product_models import (
@@ -39,6 +40,8 @@ from memos.api.product_models import (
     DeleteMemoryByRecordIdResponse,
     DeleteMemoryRequest,
     DeleteMemoryResponse,
+    EventLifecycleTransitionRequest,
+    EventLifecycleTransitionResponse,
     ExistMemCubeIdRequest,
     ExistMemCubeIdResponse,
     GetMemoryDashboardRequest,
@@ -93,6 +96,7 @@ chat_handler = (
 )
 feedback_handler = FeedbackHandler(dependencies)
 cube_handler = CubeHandler(dependencies)
+event_lifecycle_handler = EventLifecycleHandler(dependencies)
 # Extract commonly used components for function-based handlers
 # (These can be accessed from the components dict without unpacking all of them)
 mem_scheduler: BaseScheduler = components["mem_scheduler"]
@@ -398,6 +402,18 @@ def delete_memories(memory_req: DeleteMemoryRequest):
     return handlers.memory_handler.handle_delete_memories(
         delete_mem_req=memory_req, naive_mem_cube=naive_mem_cube
     )
+
+
+@router.post(
+    "/event_lifecycle/transition",
+    summary="Transition an event lifecycle state",
+    response_model=EventLifecycleTransitionResponse,
+)
+def transition_event_lifecycle(
+    request: EventLifecycleTransitionRequest,
+) -> EventLifecycleTransitionResponse:
+    """Apply an exact internal event lifecycle transition."""
+    return event_lifecycle_handler.handle_transition(request)
 
 
 # =============================================================================

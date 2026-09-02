@@ -186,6 +186,9 @@ venv.bak/
 # but do not ignore docs/openapi.json
 !docs/openapi.json
 
+# Topic queue migration regression fixture
+!tests/fixtures/topic_queue_v0.json
+
 # do not ignore apps/ config files
 !apps/**/*.json
 !apps/**/*.html

@@ -9,8 +9,11 @@ import type {
   TopicSelectionTrace,
 } from "@/lib/api-client.ts";
 import {
+  formatTopicQueueExplanation,
   formatTopicScore,
   formatTopicTime,
+  getTopicAttentionStatusLabel,
+  getTopicCandidateSourceLabel,
   getTopicMemoryScoreState,
   getTopicStatusLabel,
 } from "@/lib/topic-display.ts";
@@ -57,75 +60,23 @@ function boundedScoreMetric(label: string, value: number, max = 100): ScoreMetri
   };
 }
 
-function appendScoreMetric(
-  metrics: ScoreMetric[],
-  label: string,
-  value: number | null,
-  max = 100,
-): void {
-  if (value === null) {
-    return;
-  }
-  metrics.push(boundedScoreMetric(label, value, max));
-}
-
 function topicScoreMetrics(topic: Topic): ScoreMetric[] {
-  const overall = boundedScoreMetric("排名分", topic.score);
-  const breakdown = topic.score_breakdown;
-
-  switch (breakdown.model) {
-    case "memory_importance_v2": {
-      const recencyPercent = breakdown.recency_factor * 100;
-      return [
-        overall,
-        boundedScoreMetric("基础分", breakdown.base_score),
-        boundedScoreMetric("最强单条", breakdown.strongest_memory_score),
-        {
-          label: "其他记忆加分",
-          value: breakdown.supporting_memory_points,
-          display: `+${formatTopicScore(breakdown.supporting_memory_points)}`,
-          max: 100,
-        },
-        {
-          label: "新鲜系数",
-          value: recencyPercent,
-          display: `${formatTopicScore(recencyPercent)}%`,
-          max: 100,
-        },
-        {
-          label: "参与计分",
-          value: breakdown.counted_memory_ids.length,
-          display: `${breakdown.counted_memory_ids.length} 条`,
-        },
-        {
-          label: "重复忽略",
-          value: breakdown.duplicate_memory_count,
-          display: `${formatTopicScore(breakdown.duplicate_memory_count)} 条`,
-        },
-      ];
-    }
-    case "legacy_evidence_v1": {
-      const metrics: ScoreMetric[] = [overall];
-      appendScoreMetric(metrics, "基础", breakdown.base_score);
-      appendScoreMetric(metrics, "证据", breakdown.evidence_points, 30);
-      appendScoreMetric(metrics, "主动", breakdown.initiative_points, 25);
-      appendScoreMetric(metrics, "紧急", breakdown.urgency_points, 20);
-      appendScoreMetric(metrics, "持续", breakdown.continuity_points, 15);
-      appendScoreMetric(metrics, "状态", breakdown.status_points, 10);
-      if (breakdown.recency_factor !== null) {
-        metrics.push(boundedScoreMetric("新鲜", breakdown.recency_factor * 100));
-      }
-      return metrics;
-    }
-    case "partial": {
-      const metrics: ScoreMetric[] = [overall];
-      appendScoreMetric(metrics, "基础分", breakdown.base_score);
-      if (breakdown.recency_factor !== null) {
-        metrics.push(boundedScoreMetric("新鲜系数", breakdown.recency_factor * 100));
-      }
-      return metrics;
-    }
-  }
+  return [
+    boundedScoreMetric("重要度", topic.importance_score, 100),
+    {
+      label: "事件临近",
+      value: topic.approaching_bonus,
+      display: `+${formatTopicScore(topic.approaching_bonus)} / 20`,
+      max: 20,
+    },
+    {
+      label: "陈旧衰减",
+      value: topic.decay_penalty,
+      display: `-${formatTopicScore(topic.decay_penalty)} / 20`,
+      max: 20,
+    },
+    boundedScoreMetric("当前队列分", topic.queue_score, 120),
+  ];
 }
 
 function evidenceRows(topic: Topic): EvidenceRow[] {
@@ -143,6 +94,8 @@ function evidenceRows(topic: Topic): EvidenceRow[] {
 
 function scoreModelLabel(topic: Topic): string {
   switch (topic.score_breakdown.model) {
+    case "static_importance_v3":
+      return "静态重要度";
     case "memory_importance_v2":
       return "重要性评分";
     case "legacy_evidence_v1":
@@ -243,6 +196,14 @@ export default function TopicDetailDrawer({
         <div className="drawer-body">
           <div className="detail-badges">
             <span className={`lifecycle ${topic.status}`}>{getTopicStatusLabel(topic.status)}</span>
+            <span className={`candidate-source ${topic.candidate_source || "core"}`}>
+              {getTopicCandidateSourceLabel(topic.candidate_source)}
+            </span>
+            {topic.attention_status === "past_unconfirmed" && (
+              <span className="attention-status past-unconfirmed">
+                {getTopicAttentionStatusLabel(topic.attention_status)}
+              </span>
+            )}
             <span className="source-pill">最近证据 {formatTopicTime(topic.last_evidence_at)}</span>
             <span className="type-pill">{getTopicStatusLabel(topic.progress)}</span>
             <span className="type-pill">{scoreModelLabel(topic)}</span>
@@ -270,19 +231,15 @@ export default function TopicDetailDrawer({
               );
             })}
           </section>
-          {topic.score_breakdown.model === "memory_importance_v2" && (
-            <p className="score-explanation">
-              基础分取最强单条记忆，并叠加其他参与计分记忆的半权分；排名分再乘以新鲜系数。
-            </p>
-          )}
-          {topic.score_breakdown.model === "partial" && (
-            <p className="score-explanation warning">
-              这条 Topic 只有部分评分字段，页面不会把缺失字段显示成 0。
-            </p>
-          )}
+          <p className={`score-explanation ${topic.attention_status === "past_unconfirmed" ? "warning" : ""}`}>
+            {formatTopicQueueExplanation(topic)}
+          </p>
           <dl className="topic-time-grid">
             <div><dt>首次出现</dt><dd>{formatTopicTime(topic.first_seen_at)}</dd></div>
             <div><dt>最近证据</dt><dd>{formatTopicTime(topic.last_evidence_at)}</dd></div>
+            <div><dt>进入核心</dt><dd>{formatTopicTime(topic.core_entered_at)}</dd></div>
+            <div><dt>降为候选</dt><dd>{formatTopicTime(topic.demoted_at)}</dd></div>
+            <div><dt>本次计算</dt><dd>{formatTopicTime(topic.calculated_at)}</dd></div>
           </dl>
           {!!topic.candidate_reasons.length && (
             <section className="detail-section candidate-section">

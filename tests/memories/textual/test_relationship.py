@@ -4,9 +4,11 @@ from datetime import datetime, timedelta, timezone
 
 from memos.memories.textual.item import TextualMemoryItem, TreeNodeTextualMemoryMetadata
 from memos.memories.textual.relationship import (
+    EventMemoryInfo,
     MemoryInfoEnricher,
     PersonalMemoryNormalizer,
     RelationshipUpdater,
+    _normalize_absolute_event_times,
     decode_historical_events,
 )
 
@@ -188,6 +190,45 @@ def test_personal_memory_normalizer_merges_dependent_fragments_into_one_event() 
     assert result.contact_updates == []
 
 
+def test_personal_memory_normalizer_preserves_provided_source_recorded_at() -> None:
+    llm = FakeLLM(
+        [
+            {
+                "events": [
+                    {
+                        "source_indices": [0],
+                        "key": "A公司技术面试",
+                        "memory": "用户计划于2026年8月28日参加A公司的技术面试。",
+                        "info": {
+                            "record_type": "event",
+                            "event_type": "meeting",
+                            "event_status": "planned",
+                            "event_actor": "用户",
+                            "event_action": "参加技术面试",
+                            "event_target": "A公司",
+                            "event_time": "2026-08-28",
+                            "source_recorded_at": "2099-01-01T00:00:00+08:00",
+                        },
+                    }
+                ],
+                "contact_updates": [],
+                "discarded": [],
+            }
+        ]
+    )
+    candidate = make_memory(
+        "用户计划于2026年8月28日参加A公司的技术面试。",
+        {"source_recorded_at": "2026-08-21T09:30:00+08:00"},
+    )
+
+    result = PersonalMemoryNormalizer(llm, FakeEmbedder()).normalize(
+        [candidate],
+        user_id="user-1",
+    )
+
+    assert result.events[0].metadata.info["source_recorded_at"] == ("2026-08-21T09:30:00+08:00")
+
+
 def test_personal_memory_normalizer_keeps_complete_events_before_truncated_tail() -> None:
     response = """{
       "events": [
@@ -263,6 +304,139 @@ def test_personal_memory_normalizer_converts_preference_to_ongoing_event() -> No
     assert result.events[0].metadata.info["event_type"] == "preference"
     assert result.events[0].metadata.info["event_status"] == "ongoing"
     assert result.events[0].metadata.info["event_time"] is None
+
+
+def test_event_info_supports_absolute_start_and_end_times() -> None:
+    info = EventMemoryInfo.model_validate(
+        {
+            "event_status": "completed",
+            "event_time": "2026-08-28T10:00:00+08:00",
+            "event_start_time": "2026-08-28T10:00:00+08:00",
+            "event_end_time": "2026-08-28T11:00:00+08:00",
+            "event_time_text": "8月28日上午十点到十一点",
+        }
+    )
+
+    assert info.event_start_time == "2026-08-28T10:00:00+08:00"
+    assert info.event_end_time == "2026-08-28T11:00:00+08:00"
+
+
+def test_personal_memory_normalizer_records_automatic_update_decision() -> None:
+    existing = make_memory(
+        "用户计划于2026年8月28日10:00参加A公司的技术面试。",
+        {
+            "record_type": "event",
+            "event_type": "meeting",
+            "event_status": "planned",
+            "event_actor": "用户",
+            "event_action": "参加技术面试",
+            "event_target": "A公司",
+            "event_time": "2026-08-28T10:00:00+08:00",
+        },
+    )
+    llm = FakeLLM(
+        [
+            {
+                "events": [
+                    {
+                        "source_indices": [0],
+                        "operation": "UPDATE",
+                        "target_memory_id": existing.id,
+                        "changed_fields": ["event_status", "event_start_time", "memory"],
+                        "decision_reason": "同一场面试已经开始。",
+                        "key": "A公司技术面试",
+                        "memory": "用户于2026年8月28日10:00开始参加A公司的技术面试。",
+                        "info": {
+                            "record_type": "event",
+                            "event_type": "meeting",
+                            "event_status": "ongoing",
+                            "event_actor": "用户",
+                            "event_action": "参加技术面试",
+                            "event_target": "A公司",
+                            "event_time": "2026-08-28T10:00:00+08:00",
+                            "event_start_time": "2026-08-28T10:00:00+08:00",
+                        },
+                    }
+                ],
+                "contact_updates": [],
+                "discarded": [],
+            }
+        ]
+    )
+
+    result = PersonalMemoryNormalizer(llm, FakeEmbedder()).normalize(
+        [make_memory("用户正在参加A公司的技术面试。")],
+        user_id="user-1",
+        existing_events=[existing],
+    )
+
+    decision = result.events[0].metadata.internal_info["event_upsert"]
+    assert decision == {
+        "operation": "UPDATE",
+        "target_memory_id": existing.id,
+        "changed_fields": ["event_status", "event_start_time", "memory"],
+        "reason": "同一场面试已经开始。",
+    }
+
+
+def test_personal_memory_normalizer_does_not_store_relative_structured_time() -> None:
+    llm = FakeLLM(
+        [
+            {
+                "events": [
+                    {
+                        "source_indices": [0],
+                        "key": "数据采集任务",
+                        "memory": "用户需要在后天上午完成数据采集任务。",
+                        "info": {
+                            "record_type": "event",
+                            "event_status": "planned",
+                            "event_time": "后天上午",
+                            "event_time_text": None,
+                        },
+                    }
+                ],
+                "contact_updates": [],
+                "discarded": [],
+            }
+        ]
+    )
+
+    result = PersonalMemoryNormalizer(llm, FakeEmbedder()).normalize(
+        [make_memory("用户需要在后天上午完成数据采集任务。")],
+        user_id="user-1",
+    )
+
+    info = result.events[0].metadata.info
+    assert info["event_time"] is None
+    assert info["event_time_text"] == "后天上午"
+
+
+def test_event_times_are_canonicalized_to_iso_before_storage() -> None:
+    info = {
+        "event_time": "2026年9月3日",
+        "event_start_time": "2026/9/3",
+        "event_end_time": "2026-9-3",
+        "event_time_text": None,
+    }
+
+    _normalize_absolute_event_times(info)
+
+    assert info["event_time"] == "2026-09-03"
+    assert info["event_start_time"] == "2026-09-03"
+    assert info["event_end_time"] == "2026-09-03"
+
+
+def test_coarse_non_iso_time_is_kept_only_as_source_text() -> None:
+    info = {
+        "event_time": "2026年9月3日上午",
+        "event_time_text": None,
+    }
+
+    _normalize_absolute_event_times(info)
+
+    assert info["event_time"] is None
+    assert info["event_time_text"] == "2026年9月3日上午"
 
 
 def test_personal_memory_normalizer_routes_relationship_fact_without_storing_it_as_event() -> None:

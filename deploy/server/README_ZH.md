@@ -89,7 +89,7 @@ nano .env
 在可信的 Windows 电脑生成登录配置：
 
 ```powershell
-cd D:\project-memo\MemOS
+cd <仓库目录>
 .\scripts\set_memos_access_password.ps1
 ```
 
@@ -126,6 +126,7 @@ NEO4J_PASSWORD=使用独立的长随机密码
 MEMOS_ACCESS_PASSWORD_HASH=密码工具生成的哈希
 MEMOS_SESSION_SECRET=密码工具生成的至少32位随机密钥
 MEMOS_CORS_ALLOWED_ORIGINS=
+MEMOS_TOPIC_SCHEDULER_ENABLED=true
 MEMOS_HTTP_PORT=80
 MEMOS_HTTPS_PORT=443
 PIP_INDEX_URL=https://pypi.org/simple
@@ -140,6 +141,8 @@ PIP_INDEX_URL=https://pypi.org/simple
   `.server.env`，Compose 会将它们传入应用后端；
 - `MEMOS_CORS_ALLOWED_ORIGINS`：前后端同源部署时保持为空；只有其他网站需要直接调用 API 时，
   才填写完整来源，多个来源用英文逗号分隔；
+- `MEMOS_TOPIC_SCHEDULER_ENABLED`：保持为 `true`，由唯一的 `app-backend` 进程运行 Topic
+  scheduler；
 - `MEMOS_HTTP_PORT`、`MEMOS_HTTPS_PORT`：Caddy 发布到宿主机的端口。默认使用 80/443；
   如果当前机器的 80 端口已被占用，可以只把 `MEMOS_HTTP_PORT` 改成 8080；
 - `PIP_INDEX_URL`：构建后端镜像时使用的 Python 包索引。默认使用 PyPI；网络受限的服务器
@@ -179,6 +182,21 @@ caddy
 ```
 
 只有 Caddy 应显示宿主机端口 `80:80` 和 `443:443`。
+
+### Topic 唯一写入者约束
+
+`app-backend` 是 `topic_data` 的唯一 Topic writer，也是唯一挂载 Topic 状态目录的服务。
+`MEMOS_TOPIC_SCHEDULER_ENABLED=true` 会让 scheduler 在这个单一进程内运行。为避免多个进程同时
+改写 `topics.json`，部署时必须遵守：
+
+- 不能扩容 `app-backend`，也不能设置 `deploy.replicas` 或执行
+  `docker compose up --scale app-backend=2`；
+- 不能把 `app-backend` 改成多 worker 启动；
+- 不能新增 Topic scheduler sidecar、第二个 Topic worker，或让其他服务挂载并写入
+  `topic_data`。
+
+如果以后需要高可用或多副本，必须先把 Topic 状态迁移到支持并发写入和分布式锁的存储，不能直接
+复制当前容器。
 
 ## 6. 访问页面
 
@@ -281,7 +299,7 @@ sudo docker compose --env-file .server.env down
 sudo docker compose --env-file .server.env down -v
 ```
 
-`-v` 会删除 Neo4j、Qdrant、Topic、上传文件和 Caddy 证书数据卷。
+`-v` 会删除 Neo4j、Qdrant、Topic、计划追踪、上传文件和 Caddy 证书数据卷。
 
 ## 10. 数据卷
 
@@ -289,7 +307,8 @@ sudo docker compose --env-file .server.env down -v
 neo4j_data   Neo4j 记忆和关系
 neo4j_logs   Neo4j 日志
 qdrant_data  向量索引
-topic_data   Topic 状态
+topic_data   Topic 状态（仅 app-backend 挂载并写入）
+plan_tracker_data  事件计划与到期检查状态
 upload_data  前端上传文件
 caddy_data   HTTPS 证书
 caddy_config Caddy 运行配置

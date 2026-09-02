@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 
 from memos.configs.graph_db import Neo4jGraphDBConfig
+from memos.exceptions import VectorDBError
 from memos.graph_dbs.neo4j import (
     Neo4jGraphDB,
     _flatten_info_fields,
@@ -55,6 +56,35 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
     def add_node(
         self, id: str, memory: str, metadata: dict[str, Any], user_name: str | None = None
     ) -> None:
+        self._add_node(
+            id,
+            memory,
+            metadata,
+            user_name=user_name,
+            strict_vector_write=False,
+        )
+
+    def add_node_strict(
+        self, id: str, memory: str, metadata: dict[str, Any], user_name: str | None = None
+    ) -> None:
+        """Write one node without accepting a partial vector-store failure."""
+        self._add_node(
+            id,
+            memory,
+            metadata,
+            user_name=user_name,
+            strict_vector_write=True,
+        )
+
+    def _add_node(
+        self,
+        id: str,
+        memory: str,
+        metadata: dict[str, Any],
+        *,
+        user_name: str | None,
+        strict_vector_write: bool,
+    ) -> None:
         user_name = user_name if user_name else self.config.user_name
         if not self.config.use_multi_db and (self.config.user_name or user_name):
             metadata["user_name"] = user_name
@@ -74,6 +104,8 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 metadata["sources"][idx] = json.dumps(metadata["sources"][idx])
         # Extract required fields
         embedding = metadata.pop("embedding", None)
+        if embedding is None and strict_vector_write:
+            embedding = self._require_existing_vector(id)
 
         # Merge node and set metadata
         created_at = metadata.pop("created_at")
@@ -94,6 +126,8 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 )
                 self.vec_db.add([item])
             except Exception as e:
+                if strict_vector_write:
+                    raise
                 logger.warning(f"[VecDB] Vector insert failed for node {id}: {e}")
                 vector_sync_status = "failed"
         else:
@@ -116,6 +150,12 @@ class Neo4jCommunityGraphDB(Neo4jGraphDB):
                 updated_at=updated_at,
                 metadata=metadata,
             )
+
+    def _require_existing_vector(self, id: str) -> list[float]:
+        for item in self.vec_db.get_by_ids([id]):
+            if item.id == id and item.vector is not None:
+                return item.vector
+        raise VectorDBError("Strict vector write requires an embedding")
 
     def add_nodes_batch(self, nodes: list[dict[str, Any]], user_name: str | None = None) -> None:
         print("neo4j_community add_nodes_batch:")

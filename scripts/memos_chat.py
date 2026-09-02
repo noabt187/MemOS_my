@@ -570,6 +570,89 @@ class MemOSClient:
             },
         )
 
+    def list_text_memories(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        page_size: int = 200,
+    ) -> list[dict[str, Any]]:
+        """Read every text memory through bounded dashboard pages."""
+        bounded_page_size = max(1, min(500, page_size))
+        page = 1
+        memories: list[dict[str, Any]] = []
+        seen_ids: set[str] = set()
+        while True:
+            result = self._request(
+                "POST",
+                "/product/get_memory_dashboard",
+                {
+                    "mem_cube_id": cube_id,
+                    "user_id": user_id,
+                    "include_preference": False,
+                    "include_tool_memory": False,
+                    "include_skill_memory": False,
+                    "filter": {
+                        "and": [
+                            {"status": "activated"},
+                            {"record_type": "event"},
+                        ]
+                    },
+                    "page": page,
+                    "page_size": bounded_page_size,
+                },
+            )
+            data = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(data, dict):
+                raise MemOSClientError("MemOS 返回了无效的记忆列表。")
+            page_memories = [
+                memory
+                for group in data.get("text_mem", [])
+                if isinstance(group, dict)
+                for memory in group.get("memories", [])
+                if isinstance(memory, dict)
+            ]
+            for memory in page_memories:
+                memory_id = str(memory.get("id") or memory.get("memory_id") or "").strip()
+                if memory_id and memory_id not in seen_ids:
+                    memories.append(memory)
+                    seen_ids.add(memory_id)
+
+            statistics = data.get("statistics")
+            total_nodes = (
+                statistics.get("total_text_nodes") if isinstance(statistics, dict) else None
+            )
+            if isinstance(total_nodes, int) and page * bounded_page_size >= total_nodes:
+                break
+            if len(page_memories) < bounded_page_size:
+                break
+            page += 1
+        return memories
+
+    def transition_event_lifecycle(
+        self,
+        *,
+        user_id: str,
+        cube_id: str,
+        memory_id: str,
+        expected_version: int,
+        to_status: str,
+        observed_at: str,
+    ) -> Any:
+        """Request one narrow, version-checked event lifecycle transition."""
+        return self._request(
+            "POST",
+            "/product/event_lifecycle/transition",
+            {
+                "user_id": user_id,
+                "cube_id": cube_id,
+                "memory_id": memory_id,
+                "expected_version": expected_version,
+                "to_status": to_status,
+                "observed_at": observed_at,
+            },
+        )
+
     def get_scheduler_status(self) -> Any:
         """Return MemOS scheduler status for backend-side dashboard aggregation."""
         return self._request("GET", "/product/scheduler/allstatus")
@@ -1162,23 +1245,47 @@ def _print_topic_update(client: MemOSClient) -> None:
         print("已完成标签提取和候选计算；当前还没有达到生成阈值的 Topic。")
         return
 
-    print(f"当前滚动 Topic（最多 {update.get('rolling_limit', 15)} 个）：")
-    for index, topic in enumerate(topics, start=1):
-        if not isinstance(topic, dict):
-            continue
-        print(f"{index}. {topic.get('topic_text', '')}")
-        if topic.get("reason_summary"):
-            print(f"   理由：{topic['reason_summary']}")
-        evidence = topic.get("reason_evidence")
-        if not isinstance(evidence, list):
-            continue
-        for item in evidence:
-            if not isinstance(item, dict):
+    rows = [topic for topic in topics if isinstance(topic, dict)]
+    has_queue_lanes = any(
+        topic.get("lifecycle_status") in {"active", "suppressed"} for topic in rows
+    )
+    core_topics = (
+        [topic for topic in rows if topic.get("lifecycle_status") == "active"]
+        if has_queue_lanes
+        else rows
+    )
+    candidate_topics = (
+        [topic for topic in rows if topic.get("lifecycle_status") == "suppressed"]
+        if has_queue_lanes
+        else []
+    )
+
+    def print_rows(items: list[dict[str, Any]]) -> None:
+        for fallback_rank, topic in enumerate(items, start=1):
+            rank = topic.get("queue_rank") or fallback_rank
+            print(f"{rank}. {topic.get('topic_text', '')}")
+            if topic.get("reason_summary"):
+                print(f"   理由：{topic['reason_summary']}")
+            evidence = topic.get("reason_evidence")
+            if not isinstance(evidence, list):
                 continue
-            memory_id = str(item.get("memory_id") or "")
-            fact = str(item.get("fact") or "")
-            contribution = str(item.get("contribution") or "")
-            print(f"   证据 {memory_id}: {fact}（{contribution}）")
+            for item in evidence:
+                if not isinstance(item, dict):
+                    continue
+                memory_id = str(item.get("memory_id") or "")
+                fact = str(item.get("fact") or "")
+                contribution = str(item.get("contribution") or "")
+                print(f"   证据 {memory_id}: {fact}（{contribution}）")
+
+    if has_queue_lanes:
+        print(f"当前核心 Topic（{len(core_topics)} / {update.get('rolling_limit', 3)}）：")
+        print_rows(core_topics)
+        if candidate_topics:
+            print(f"可见候选 Topic（{len(candidate_topics)} / 27）：")
+            print_rows(candidate_topics)
+    else:
+        print(f"当前滚动 Topic（最多 {update.get('rolling_limit', 3)} 个）：")
+        print_rows(core_topics)
 
 
 def parse_args() -> argparse.Namespace:

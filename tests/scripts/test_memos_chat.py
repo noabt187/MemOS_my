@@ -431,7 +431,6 @@ def test_print_topic_update_shows_generated_topic_and_reason(capsys):
     client = memos_chat.MemOSClient("http://127.0.0.1:8000")
     client.last_topic_update = {
         "processed_memories": 1,
-        "rolling_limit": 15,
         "topics": [
             {
                 "topic_text": "用户正在推进视频解析器开发。",
@@ -444,9 +443,41 @@ def test_print_topic_update_shows_generated_topic_and_reason(capsys):
 
     output = capsys.readouterr().out
     assert "自动处理了 1 条新记忆" in output
-    assert "当前滚动 Topic（最多 15 个）" in output
+    assert "当前滚动 Topic（最多 3 个）" in output
     assert "用户正在推进视频解析器开发" in output
     assert "开发任务和交付时间已经明确" in output
+
+
+def test_print_topic_update_separates_core_and_candidate_topics(capsys):
+    client = memos_chat.MemOSClient("http://127.0.0.1:8000")
+    client.last_topic_update = {
+        "processed_memories": 2,
+        "rolling_limit": 3,
+        "core_count": 1,
+        "visible_candidate_count": 1,
+        "topics": [
+            {
+                "topic_text": "核心事项",
+                "reason_summary": "今天最重要。",
+                "lifecycle_status": "active",
+                "queue_rank": 1,
+            },
+            {
+                "topic_text": "候选事项",
+                "reason_summary": "暂时等待。",
+                "lifecycle_status": "suppressed",
+                "queue_rank": 1,
+            },
+        ],
+    }
+
+    memos_chat._print_topic_update(client)
+
+    output = capsys.readouterr().out
+    assert "当前核心 Topic（1 / 3）" in output
+    assert "可见候选 Topic（1 / 27）" in output
+    assert "1. 核心事项" in output
+    assert "1. 候选事项" in output
 
 
 def test_zero_memory_import_result_does_not_claim_memory_or_topic_queue(capsys, tmp_path: Path):

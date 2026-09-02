@@ -44,6 +44,24 @@ def test_personal_memory_normalizer_preserves_explicit_timeline_segments():
     assert "只有属于同一时间段" in prompt
 
 
+def test_personal_memory_normalizer_owns_event_identity_decisions_without_requiring_ids():
+    prompt = memory_info_prompts.PERSONAL_MEMORY_NORMALIZE_PROMPT_ZH
+
+    assert "您负责做最终的事件语义判断" in prompt
+    assert "现实事件不要求具有事件编号" in prompt
+    assert "同一事件发生改期、取消、完成、恢复" in prompt
+    assert "不确定时使用 ADD" in prompt
+
+
+def test_memory_info_prompts_define_due_unverified_as_unclosed():
+    for prompt in (
+        memory_info_prompts.PERSONAL_MEMORY_NORMALIZE_PROMPT_ZH,
+        memory_info_prompts.MEMORY_INFO_ENRICH_PROMPT_ZH,
+    ):
+        assert "due_unverified" in prompt
+        assert "到期但没有证据确认结果" in prompt
+
+
 def test_validate_memory_extraction_result_accepts_canonical_schema():
     result = utils.validate_memory_extraction_result(
         {

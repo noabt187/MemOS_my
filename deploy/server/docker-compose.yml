@@ -54,8 +54,13 @@ services:
       MEMOS_API_BASE_URL: http://memos:8000
       MEMOS_APP_USER_ID: default
       MEMOS_APP_CUBE_ID: default_cube
-      MEMOS_TOPIC_DAILY_LIMIT: "15"
+      MEMOS_TOPIC_SCHEDULER_ENABLED: ${MEMOS_TOPIC_SCHEDULER_ENABLED:-true}
       MEMOS_TOPIC_STATE: /data/topic/topics.json
+      MEMOS_PLAN_TRACKER_ENABLED: "true"
+      MEMOS_PLAN_TRACKER_STATE: /data/plan-tracker/tracker.json
+      MEMOS_PLAN_TRACKER_INTERVAL_SECONDS: "60"
+      MEMOS_PLAN_TRACKER_RECONCILE_SECONDS: "900"
+      TZ: Asia/Shanghai
       MEMOS_WEB_UPLOAD_DIR: /data/uploads
       MEMOS_AUTH_REQUIRED: "true"
       MEMOS_AUTH_COOKIE_SECURE: "true"
@@ -65,6 +70,7 @@ services:
       NEO4J_PASSWORD: ${NEO4J_PASSWORD:?Set NEO4J_PASSWORD in .server.env}
     volumes:
       - topic_data:/data/topic
+      - plan_tracker_data:/data/plan-tracker
       - upload_data:/data/uploads
     depends_on:
       memos:
@@ -148,6 +154,7 @@ volumes:
   neo4j_logs:
   qdrant_data:
   topic_data:
+  plan_tracker_data:
   upload_data:
   caddy_data:
   caddy_config:

@@ -4,7 +4,7 @@ import re
 import uuid
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -25,7 +25,14 @@ from memos.templates.memory_info_prompts import (
 logger = get_logger(__name__)
 
 AssertionBasis = Literal["explicit_single", "explicit_multiple", "inferred", "mixed", "uncertain"]
-EventStatus = Literal["planned", "completed", "cancelled", "ongoing", "uncertain"]
+EventStatus = Literal[
+    "planned",
+    "completed",
+    "cancelled",
+    "ongoing",
+    "due_unverified",
+    "uncertain",
+]
 RelationStatus = Literal["active", "inactive", "former", "uncertain"]
 
 EVENT_INFO_FIELDS = {
@@ -42,6 +49,8 @@ EVENT_INFO_FIELDS = {
     "participant_keys",
     "event_location",
     "event_time",
+    "event_start_time",
+    "event_end_time",
     "event_time_text",
     "source_recorded_at",
 }
@@ -90,6 +99,8 @@ class EventMemoryInfo(BaseModel):
     participant_keys: list[str] = Field(default_factory=list)
     event_location: str | None = None
     event_time: str | None = None
+    event_start_time: str | None = None
+    event_end_time: str | None = None
     event_time_text: str | None = None
     source_recorded_at: str | None = None
 
@@ -537,8 +548,50 @@ def _normalize_event_info(info: dict[str, Any], user_id: str) -> EventMemoryInfo
             participant_keys.append(stable_person_key(name))
     normalized["participants"] = participants
     normalized["participant_keys"] = participant_keys
+    _normalize_absolute_event_times(normalized)
     normalized["record_type"] = "event"
     return EventMemoryInfo.model_validate(normalized)
+
+
+_ABSOLUTE_DATE_ONLY_PATTERN = re.compile(
+    r"^(\d{4})(?:-|/|\.|年)(\d{1,2})(?:-|/|\.|月)(\d{1,2})日?$"
+)
+
+
+def _normalize_absolute_event_times(info: dict[str, Any]) -> None:
+    """Keep unresolved time phrases as evidence, never as canonical event time."""
+    for field in ("event_time", "event_start_time", "event_end_time"):
+        value = info.get(field)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if not text:
+            info[field] = None
+            continue
+        canonical = _canonical_absolute_event_time(text)
+        if canonical is not None:
+            info[field] = canonical
+            continue
+        if not info.get("event_time_text"):
+            info["event_time_text"] = text
+        info[field] = None
+
+
+def _canonical_absolute_event_time(value: str) -> str | None:
+    date_match = _ABSOLUTE_DATE_ONLY_PATTERN.fullmatch(value)
+    if date_match is not None:
+        try:
+            parsed_date = date(*(int(part) for part in date_match.groups()))
+        except ValueError:
+            return None
+        return parsed_date.isoformat()
+
+    normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed.isoformat()
 
 
 class PersonalMemoryNormalizer:
@@ -555,6 +608,7 @@ class PersonalMemoryNormalizer:
         *,
         use_llm: bool = True,
         source_material: Any | None = None,
+        existing_events: list[TextualMemoryItem] | None = None,
     ) -> PersonalMemoryNormalizationResult:
         if not memories:
             return PersonalMemoryNormalizationResult([], [], [])
@@ -563,8 +617,18 @@ class PersonalMemoryNormalizer:
             return self._keep_valid_supplied_events(memories, user_id)
 
         payload = [self._candidate_payload(index, memory) for index, memory in enumerate(memories)]
+        existing_events = existing_events or []
+        existing_event_ids = {memory.id for memory in existing_events}
         prompt = PERSONAL_MEMORY_NORMALIZE_PROMPT_ZH.replace(
             "${memories}", json.dumps(payload, ensure_ascii=False, indent=2)
+        )
+        prompt = prompt.replace(
+            "${existing_events}",
+            json.dumps(
+                [self._existing_event_payload(memory) for memory in existing_events],
+                ensure_ascii=False,
+                indent=2,
+            ),
         )
         try:
             response = self.llm.generate(_build_enrichment_messages(prompt, source_material))
@@ -584,7 +648,12 @@ class PersonalMemoryNormalizer:
             events: list[TextualMemoryItem] = []
             recovered_indices: set[int] = set()
             for raw_event in raw_events:
-                event = self._build_event(raw_event, memories, user_id)
+                event = self._build_event(
+                    raw_event,
+                    memories,
+                    user_id,
+                    existing_event_ids=existing_event_ids,
+                )
                 if event is None:
                     continue
                 events.append(event)
@@ -616,7 +685,12 @@ class PersonalMemoryNormalizer:
             raw_events = []
         events: list[TextualMemoryItem] = []
         for raw_event in raw_events:
-            event = self._build_event(raw_event, memories, user_id)
+            event = self._build_event(
+                raw_event,
+                memories,
+                user_id,
+                existing_event_ids=existing_event_ids,
+            )
             if event is not None:
                 events.append(event)
 
@@ -663,11 +737,24 @@ class PersonalMemoryNormalizer:
             "source_evidence": _memory_source_evidence(memory),
         }
 
+    @staticmethod
+    def _existing_event_payload(memory: TextualMemoryItem) -> dict[str, Any]:
+        return {
+            "memory_id": memory.id,
+            "memory": memory.memory,
+            "key": memory.metadata.key,
+            "version": memory.metadata.version,
+            "updated_at": memory.metadata.updated_at,
+            "info": extract_memory_info(memory.metadata),
+        }
+
     def _build_event(
         self,
         raw_event: Any,
         memories: list[TextualMemoryItem],
         user_id: str,
+        *,
+        existing_event_ids: set[str] | None = None,
     ) -> TextualMemoryItem | None:
         if not isinstance(raw_event, dict):
             return None
@@ -683,19 +770,20 @@ class PersonalMemoryNormalizer:
 
         selected = [memories[index] for index in source_indices]
         item = selected[0].model_copy(deep=True)
+        provided_source_recorded_at = next(
+            (
+                extract_memory_info(source.metadata).get("source_recorded_at")
+                for source in selected
+                if extract_memory_info(source.metadata).get("source_recorded_at")
+            ),
+            None,
+        )
         combined_info: dict[str, Any] = {}
         for source in selected:
             combined_info.update(extract_memory_info(source.metadata))
         combined_info.update(info)
-        if not combined_info.get("source_recorded_at"):
-            combined_info["source_recorded_at"] = next(
-                (
-                    extract_memory_info(source.metadata).get("source_recorded_at")
-                    for source in selected
-                    if extract_memory_info(source.metadata).get("source_recorded_at")
-                ),
-                None,
-            )
+        if provided_source_recorded_at:
+            combined_info["source_recorded_at"] = provided_source_recorded_at
         try:
             normalized_info = _normalize_event_info(combined_info, user_id)
         except ValueError as error:
@@ -714,7 +802,49 @@ class PersonalMemoryNormalizer:
         item.metadata.sources = self._merge_sources(selected)
         item.metadata.background = self._merge_background(selected)
         item.metadata.embedding = self.embedder.embed([memory_text])[0]
+        item.metadata.internal_info = dict(item.metadata.internal_info or {})
+        item.metadata.internal_info["event_upsert"] = self._event_upsert_decision(
+            raw_event,
+            existing_event_ids or set(),
+        )
         return item
+
+    @staticmethod
+    def _event_upsert_decision(
+        raw_event: dict[str, Any],
+        existing_event_ids: set[str],
+    ) -> dict[str, Any]:
+        operation = str(raw_event.get("operation") or "ADD").strip().upper()
+        if operation not in {"ADD", "UPDATE", "NONE"}:
+            operation = "ADD"
+        target_memory_id = str(raw_event.get("target_memory_id") or "").strip() or None
+        if operation in {"UPDATE", "NONE"} and target_memory_id not in existing_event_ids:
+            logger.warning(
+                "Ignoring invalid event upsert target %s for operation %s",
+                target_memory_id,
+                operation,
+            )
+            operation = "ADD"
+            target_memory_id = None
+        if operation == "ADD":
+            target_memory_id = None
+
+        raw_changed_fields = raw_event.get("changed_fields")
+        changed_fields = (
+            list(
+                dict.fromkeys(
+                    str(field).strip() for field in raw_changed_fields if str(field).strip()
+                )
+            )
+            if isinstance(raw_changed_fields, list)
+            else []
+        )
+        return {
+            "operation": operation,
+            "target_memory_id": target_memory_id,
+            "changed_fields": changed_fields,
+            "reason": str(raw_event.get("decision_reason") or "").strip(),
+        }
 
     @staticmethod
     def _valid_source_indices(indices: Any, memory_count: int) -> bool:
@@ -778,6 +908,16 @@ class PersonalMemoryNormalizer:
                 discarded.append({"source_indices": [index], "reason": "invalid_event_info"})
                 continue
             memory.metadata.memory_type = "LongTermMemory"
+            memory.metadata.internal_info = dict(memory.metadata.internal_info or {})
+            memory.metadata.internal_info.setdefault(
+                "event_upsert",
+                {
+                    "operation": "ADD",
+                    "target_memory_id": None,
+                    "changed_fields": [],
+                    "reason": "未启用精细事件整理，按新事件写入",
+                },
+            )
             events.append(memory)
         return PersonalMemoryNormalizationResult(events, [], discarded)
 

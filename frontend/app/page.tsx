@@ -5,6 +5,7 @@ import { type ReactElement, useCallback, useEffect, useMemo, useState } from "re
 import { appApi } from "@/lib/api-client.ts";
 import type { Dashboard, MemoryDetail, MemorySummary } from "@/lib/api-client.ts";
 import Link from "@/lib/link.tsx";
+import { formatTopicScore, getTopicStatusLabel } from "@/lib/topic-display.ts";
 import AppRail from "./components/AppRail.tsx";
 
 const MEMORY_FILTERS = [
@@ -190,7 +191,14 @@ export default function Home(): ReactElement {
     });
   }, [allMemories, filter, query]);
 
-  const currentTopics = dashboard?.topics || [];
+  const currentTopics = useMemo(
+    () =>
+      [...(dashboard?.topics || [])]
+        .filter((topic) => topic.status === "active")
+        .sort((left, right) => left.queue_rank - right.queue_rank)
+        .slice(0, 3),
+    [dashboard],
+  );
   const counts = dashboard?.counts;
   const serviceHealthy = dashboard?.backend_status === "online";
   const serviceLabel = getServiceLabel(loading, dashboard, serviceHealthy);
@@ -284,9 +292,9 @@ export default function Home(): ReactElement {
             <p>{counts?.queue_running || 0} 运行中 · {counts?.queue_waiting || 0} 等待中</p>
           </article>
           <article className="metric-card accent">
-            <div className="metric-top"><span>当前 Topic</span><b>04</b></div>
-            <strong>{currentTopics.length}</strong>
-            <p>{dashboard ? "滚动 Top 15 席位" : "Topic 状态尚未连接"}</p>
+            <div className="metric-top"><span>核心 Topic</span><b>04</b></div>
+            <strong>{Math.min(currentTopics.length, 3)}</strong>
+            <p>{dashboard ? "今日最重要的 3 个席位" : "Topic 状态尚未连接"}</p>
           </article>
         </section>
 
@@ -351,31 +359,32 @@ export default function Home(): ReactElement {
           <aside className="side-stack">
             <section className="panel topic-panel" id="topics">
               <div className="panel-heading compact">
-                <div><p className="section-kicker">ROLLING TOPIC</p><h2>当前 Topic</h2></div>
-                <span>{currentTopics.length} 条</span>
+                <div><p className="section-kicker">CORE TOPICS</p><h2>今日核心 Topic</h2></div>
+                <span>{Math.min(currentTopics.length, 3)} / 3</span>
               </div>
               <div className="topic-section">
                 <div className="topic-title-line">
-                  <p className="topic-label">跨日期滚动席位</p>
+                  <p className="topic-label">今天最值得关注的事项</p>
                   <span>{dashboard ? "真实数据" : "未连接"}</span>
                 </div>
                 {currentTopics.length ? (
                   <div className="dashboard-topic-list">
-                    {currentTopics.slice(0, 5).map((topic) => (
+                    {currentTopics.map((topic) => (
                       <article key={topic.id}>
-                        <strong>{topic.title}</strong>
+                        <strong>#{topic.queue_rank} · {topic.title}</strong>
                         <span>{topic.reason || "暂无生成理由"}</span>
+                        <small>队列分 {formatTopicScore(topic.queue_score)}</small>
                       </article>
                     ))}
                   </div>
                 ) : (
                   <div className="topic-empty">
-                    <b>当前没有 Topic</b>
-                    <span>记忆经过 Topic 处理并达到入选条件后，会显示在这里。</span>
+                    <b>当前没有核心 Topic</b>
+                    <span>候选的重要度和队列分达到要求后，会晋升到这里。</span>
                   </div>
                 )}
               </div>
-              <Link className="topic-page-link" href="/topics">查看完整排名、依据和历史版本 <span>↗</span></Link>
+              <Link className="topic-page-link" href="/topics">查看核心、候选、依据和历史版本 <span>↗</span></Link>
             </section>
 
             <section className="panel runtime-panel" id="runtime">
@@ -425,7 +434,12 @@ export default function Home(): ReactElement {
                       ["开始时间", selectedMemory.structured.event_start_time || selectedMemory.structured.event_start_at],
                       ["结束时间", selectedMemory.structured.event_end_time || selectedMemory.structured.event_end_at],
                       ["原始时间表达", selectedMemory.structured.event_time_text],
-                      ["事件状态", selectedMemory.structured.event_status],
+                      [
+                        "事件状态",
+                        typeof selectedMemory.structured.event_status === "string"
+                          ? getTopicStatusLabel(selectedMemory.structured.event_status)
+                          : selectedMemory.structured.event_status,
+                      ],
                       ["行动者", selectedMemory.structured.event_actor],
                       ["行为", selectedMemory.structured.event_action],
                       ["对象", selectedMemory.structured.event_target],

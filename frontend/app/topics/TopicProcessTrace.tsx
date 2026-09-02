@@ -10,6 +10,8 @@ import type {
 import {
   formatTopicScore,
   formatTopicTime,
+  getTopicAttentionStatusLabel,
+  getTopicCandidateSourceLabel,
   getTopicCountingStatusLabel,
   getTopicKindLabel,
   getTopicRelationshipLabel,
@@ -109,7 +111,7 @@ function TraceMemory({ memory, policyFormula }: TraceMemoryProps): ReactElement 
         <p className="trace-formula">
           {policyFormula}。初评时间：{formatTopicTime(memory.assessed_at)}。
           {memory.eligible ? "这条记忆允许参与 Topic 选择。" : "这条记忆被初评排除。"}
-          {scoreChanged ? " 当前分与初评分不同，表示时间等固定规则后来刷新过。" : ""}
+          {scoreChanged ? " 当前分与初评分不同，表示证据后来经过了规则刷新。" : ""}
         </p>
         <div className="trace-dimension-grid">
           {memory.dimensions.map((dimension) => (
@@ -204,7 +206,7 @@ export default function TopicProcessTrace({
           <p>SELECTION TRACE</p>
           <h3>本条 Topic 的证据与计分详情</h3>
         </div>
-        <span>选择规则 v{trace.selection_version}</span>
+        <span>选择规则 v{trace.selection_version} · 队列策略 v{trace.policy.queue_policy_version}</span>
       </div>
 
       <details className="trace-detail-section" open>
@@ -212,7 +214,7 @@ export default function TopicProcessTrace({
         <div className="trace-detail-body">
           <p>
             这里展示状态文件保存的规范化单条初评，不冒充模型原始回复，也不冒充多次重评历史。
-            标签由模型判断，分值由后端固定规则换算；紧迫性来自事件时间规则，不是模型猜测。
+            标签由模型判断，重要度由后端固定规则换算；时间临近只在最后的队列阶段单独加分。
           </p>
           <div className="trace-memory-list">
             {trace.memories.map((memory) => (
@@ -271,24 +273,27 @@ export default function TopicProcessTrace({
       </details>
 
       <details className="trace-detail-section" open>
-        <summary>第四至六步 · 聚合、总结与滚动席位</summary>
+        <summary>第四至六步 · 聚合、总结与 3＋27 队列</summary>
         <div className="trace-detail-body">
           <div className="trace-decision-grid">
             <div><span>晋升门槛</span><strong>{formatTopicScore(trace.policy.topic_threshold)}</strong></div>
-            <div><span>Topic 基础分</span><strong>{formatTopicScore(trace.decision.base_score)}</strong></div>
-            <div><span>新鲜系数</span><strong>× {formatTopicScore(trace.decision.recency_factor)}</strong></div>
-            <div><span>最终排名分</span><strong>{formatTopicScore(trace.decision.rank_score)}</strong></div>
-            <div><span>当前排名</span><strong>#{trace.decision.rank_position}</strong></div>
-            <div><span>滚动席位</span><strong>{getTopicStatusLabel(trace.decision.seat_status)}</strong></div>
+            <div><span>重要度</span><strong>{formatTopicScore(trace.decision.importance_score)} / 100</strong></div>
+            <div><span>事件临近</span><strong>+{formatTopicScore(trace.decision.approaching_bonus)} / 20</strong></div>
+            <div><span>陈旧衰减</span><strong>−{formatTopicScore(trace.decision.decay_penalty)} / 20</strong></div>
+            <div><span>当前队列分</span><strong>{formatTopicScore(trace.decision.queue_score)} / 120</strong></div>
+            <div><span>队列内排名</span><strong>#{trace.decision.queue_rank}</strong></div>
+            <div><span>当前队列</span><strong>{getTopicStatusLabel(trace.decision.seat_status)}</strong></div>
+            <div><span>候选来源</span><strong>{getTopicCandidateSourceLabel(trace.decision.candidate_source)}</strong></div>
+            <div><span>注意状态</span><strong>{getTopicAttentionStatusLabel(trace.decision.attention_status)}</strong></div>
           </div>
           <div className="trace-formula-stack">
             <p><b>聚合：</b>{trace.policy.topic_formula}</p>
-            <p><b>排序：</b>{trace.policy.rank_formula}</p>
+            <p><b>队列分：</b>{trace.policy.queue_formula}</p>
             <p>
               <b>结果：</b>
               {trace.decision.qualifies
-                ? `基础分达到 ${formatTopicScore(trace.policy.topic_threshold)} 分门槛，进入滚动池。`
-                : `基础分没有达到 ${formatTopicScore(trace.policy.topic_threshold)} 分门槛。`}
+                ? `重要度达到 ${formatTopicScore(trace.policy.topic_threshold)} 分门槛，允许参与队列竞争。`
+                : `重要度没有达到 ${formatTopicScore(trace.policy.topic_threshold)} 分门槛。`}
             </p>
           </div>
           {!!trace.decision.candidate_reasons.length && (
@@ -297,7 +302,9 @@ export default function TopicProcessTrace({
             </ul>
           )}
           <p className="trace-seat-note">
-            当前滚动池最多保留 {trace.policy.seat_limit} 个席位；排名变化由分数和新鲜度共同决定。
+            核心队列最多 {trace.policy.core_limit} 席，可见候选最多 {trace.policy.visible_candidate_limit} 席。
+            固定重排至少高出末位 {formatTopicScore(trace.policy.scheduled_promotion_margin)} 分才晋升；
+            即时替换至少高出 {formatTopicScore(trace.policy.immediate_promotion_margin)} 分。
           </p>
         </div>
       </details>

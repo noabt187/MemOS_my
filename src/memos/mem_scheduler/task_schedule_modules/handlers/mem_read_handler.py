@@ -20,6 +20,11 @@ from memos.mem_scheduler.schemas.task_schemas import (
 from memos.mem_scheduler.task_schedule_modules.base_handler import BaseSchedulerHandler
 from memos.mem_scheduler.utils.filter_utils import transform_name_to_key
 from memos.mem_scheduler.utils.misc_utils import is_playground_api
+from memos.memories.textual.event_upsert import (
+    apply_event_upserts,
+    event_upsert_lock,
+    retrieve_existing_event_candidates,
+)
 from memos.memories.textual.relationship import PersonalMemoryNormalizer, RelationshipUpdater
 from memos.memories.textual.tree import TreeTextMemory
 
@@ -129,6 +134,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             task_id,
         )
         kb_log_content: list[dict] = []
+        enhanced_mem_ids: list[str] = []
         try:
             mem_reader = self.scheduler_context.get_mem_reader()
             if mem_reader is None:
@@ -196,14 +202,32 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                         for memory in flattened_memories
                         if memory.metadata.memory_type != "RawFileMemory"
                     ]
-                    normalization = PersonalMemoryNormalizer(
-                        getattr(mem_reader, "general_llm", None),
-                        text_mem.embedder,
-                    ).normalize(mem_group, user_id=user_id, use_llm=True)
-                    mem_group = normalization.events
-                    enhanced_mem_ids = text_mem.add(mem_group, user_name=user_name)
+                    with event_upsert_lock(mem_cube_id):
+                        existing_events = retrieve_existing_event_candidates(
+                            text_mem,
+                            mem_group,
+                            user_name,
+                        )
+                        normalization = PersonalMemoryNormalizer(
+                            getattr(mem_reader, "general_llm", None),
+                            text_mem.embedder,
+                        ).normalize(
+                            mem_group,
+                            user_id=user_id,
+                            use_llm=True,
+                            source_material=chat_history,
+                            existing_events=existing_events,
+                        )
+                        upsert_result = apply_event_upserts(
+                            text_mem=text_mem,
+                            events=normalization.events,
+                            existing_events=existing_events,
+                            user_name=user_name,
+                        )
+                    mem_group = upsert_result.memories
+                    enhanced_mem_ids = upsert_result.memory_ids
                     logger.info(
-                        "Added %s enhanced memories: %s",
+                        "Persisted %s enhanced memories: %s",
                         len(enhanced_mem_ids),
                         enhanced_mem_ids,
                     )
@@ -263,11 +287,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     # fallback to simple deduplication logic when mem version switch is off
                     if getattr(mem_reader, "memory_version_switch", "off") != "on":
                         # Mark merged_from memories as archived when provided in memory metadata
-                        summary_memories = [
-                            memory
-                            for memory in flattened_memories
-                            if memory.metadata.memory_type != "RawFileMemory"
-                        ]
+                        summary_memories = mem_group
                         if mem_reader.graph_db:
                             for memory in summary_memories:
                                 merged_from = (memory.metadata.info or {}).get("merged_from")
@@ -306,25 +326,23 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                     playground_api = is_playground_api()
                     if not playground_api:
                         kb_log_content = []
-                        for item in flattened_memories:
+                        for item in mem_group:
                             metadata = getattr(item, "metadata", None)
                             file_ids = getattr(metadata, "file_ids", None) if metadata else None
                             source_doc_id = (
                                 file_ids[0] if isinstance(file_ids, list) and file_ids else None
                             )
-                            # Use merged_from to determine ADD vs UPDATE.
-                            # The upstream mem_reader sets this during fine extraction when
-                            # the new memory was merged with an existing one.
-                            item_merged_from = (getattr(item.metadata, "info", None) or {}).get(
-                                "merged_from"
-                            )
+                            upsert_trace = (
+                                getattr(item.metadata, "internal_info", None) or {}
+                            ).get("event_upsert", {})
+                            operation = str(upsert_trace.get("operation") or "ADD").upper()
                             kb_log_content.append(
                                 {
                                     "log_source": "KNOWLEDGE_BASE_LOG",
                                     "trigger_source": info.get("trigger_source", "Messages")
                                     if info
                                     else "Messages",
-                                    "operation": "UPDATE" if item_merged_from else "ADD",
+                                    "operation": operation,
                                     "memory_id": item.id,
                                     "content": item.memory,
                                     "original_content": None,
@@ -363,14 +381,15 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                         add_meta_legacy: list[dict] = []
                         update_content_legacy: list[dict] = []
                         update_meta_legacy: list[dict] = []
-                        for item_id, item in zip(
-                            enhanced_mem_ids, flattened_memories, strict=False
-                        ):
+                        for item_id, item in zip(enhanced_mem_ids, mem_group, strict=False):
                             key = getattr(item.metadata, "key", None) or transform_name_to_key(
                                 name=item.memory
                             )
-                            item_merged_from = (getattr(item.metadata, "info", None) or {}).get(
-                                "merged_from"
+                            upsert_trace = (
+                                getattr(item.metadata, "internal_info", None) or {}
+                            ).get("event_upsert", {})
+                            item_is_update = (
+                                str(upsert_trace.get("operation") or "ADD").upper() == "UPDATE"
                             )
                             meta_entry = {
                                 "ref_id": item_id,
@@ -384,7 +403,7 @@ class MemReadMessageHandler(BaseSchedulerHandler):
                                 "updated_at": getattr(item.metadata, "updated_at", None)
                                 or getattr(item.metadata, "update_at", None),
                             }
-                            if item_merged_from:
+                            if item_is_update:
                                 update_content_legacy.append(
                                     {"content": f"{key}: {item.memory}", "ref_id": item_id}
                                 )
@@ -433,9 +452,14 @@ class MemReadMessageHandler(BaseSchedulerHandler):
             else:
                 logger.info("mem_reader returned no processed memories")
 
-            delete_ids = list(mem_ids)
+            persisted_ids = set(enhanced_mem_ids)
+            delete_ids = [memory_id for memory_id in mem_ids if memory_id not in persisted_ids]
             if bindings_to_delete:
-                delete_ids.extend(list(bindings_to_delete))
+                delete_ids.extend(
+                    binding_id
+                    for binding_id in bindings_to_delete
+                    if binding_id not in persisted_ids
+                )
             delete_ids = list(dict.fromkeys(delete_ids))
             if delete_ids:
                 try:
